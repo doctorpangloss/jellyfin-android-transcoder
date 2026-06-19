@@ -16,6 +16,20 @@ cd android-transcoder
 ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleDebug
 ```
 
+Test the bridge:
+
+```bash
+dotnet test JellyfinAndroidTranscoder.sln
+cd android-transcoder
+ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleDebug assembleDebugAndroidTest
+ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew connectedDebugAndroidTest
+```
+
+The .NET tests mock the Android HTTP service and verify the Jellyfin FFmpeg shim
+posts the expected request. The Android instrumentation tests install the APK on
+a connected device, start the foreground service, and make Jellyfin-style HTTP
+calls to `127.0.0.1:8098`.
+
 The APK is written to:
 
 ```text
