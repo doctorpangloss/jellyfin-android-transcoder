@@ -21,7 +21,7 @@ public sealed class AndroidBridgeIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task JellyfinStyleTranscodePostsVideoToAndroidAndPackagesResponse()
+    public async Task JellyfinStyleTranscodeStartsRemoteProcessAndMaterializesMultipartFiles()
     {
         var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
 #!/usr/bin/env bash
@@ -44,7 +44,11 @@ JSON
         await File.WriteAllTextAsync(input, "placeholder-matroska");
         var output = Path.Combine(_tempDir, "segment.m3u8");
 
-        await using var android = await MockAndroidService.Start(["mpegts-from-android"u8.ToArray()]);
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["segment0.ts"] = "mpegts-from-android"u8.ToArray(),
+            ["segment.m3u8"] = "#EXTM3U\n#EXTINF:3.000,\nsegment0.ts\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var exitCode = await Program.Main(JellyfinArgs(input, output));
@@ -56,18 +60,14 @@ JSON
         Assert.Equal("mpegts-from-android", await File.ReadAllTextAsync(Path.Combine(_tempDir, "segment0.ts")));
 
         var request = await android.GetSingleRequest();
-        Assert.Equal("/api/v1/transcode", request.Path);
+        Assert.Equal("/api/v1/remoteprocesses", request.Path);
         Assert.Equal("Bearer test-token", request.Authorization);
-        Assert.Equal("video/x-matroska", request.ContentType);
+        Assert.Equal("application/octet-stream", request.ContentType);
+        Assert.Equal("ffmpeg", request.Executable);
+        Assert.Contains("{outputRoot}/segment%d.ts", request.RemoteArgs);
+        Assert.Contains("{outputRoot}/segment.m3u8", request.RemoteArgs);
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
-        Assert.Equal("h264", request.Query["codec"]);
-        Assert.Equal("1920", request.Query["width"]);
-        Assert.Equal("1080", request.Query["height"]);
-        Assert.Equal("6000000", request.Query["bitrate"]);
-        Assert.Equal("12000000", request.Query["bufsize"]);
-        Assert.Equal("120", request.Query["gop"]);
-        Assert.Equal("1", request.Query["toneMap"]);
 
     }
 
@@ -95,10 +95,11 @@ JSON
         await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("streaming-input-", 1024)));
         var output = Path.Combine(_tempDir, "playlist.m3u8");
 
-        await using var android = await MockAndroidService.Start([
-            "mpegts-chunk-a"u8.ToArray(),
-            "mpegts-chunk-b"u8.ToArray()
-        ]);
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["playlist.m3u8"] = "#EXTM3U\n#EXTINF:3.000,\nsegment0.ts\n#EXT-X-ENDLIST\n"u8.ToArray(),
+            ["segment0.ts"] = "mpegts-chunk-ampegts-chunk-b"u8.ToArray()
+        });
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var shimExecutable = await BuildShimExecutable();
@@ -136,7 +137,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
         var ffmpegLog = Path.Combine(_tempDir, "fallback-ffmpeg.log");
         Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
 
-        await using var android = await MockAndroidService.Start(["unused"u8.ToArray()]);
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]> { ["unused"] = "unused"u8.ToArray() });
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var input = Path.Combine(_tempDir, "movie.mkv");
@@ -269,15 +270,15 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
     private sealed class MockAndroidService : IAsyncDisposable
     {
         private readonly HttpListener _listener;
-        private readonly IReadOnlyList<byte[]> _responseChunks;
+        private readonly IReadOnlyDictionary<string, byte[]> _files;
         private readonly List<AndroidRequest> _requests = [];
         private readonly Task _serverTask;
 
-        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyList<byte[]> responses)
+        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyDictionary<string, byte[]> files)
         {
             _listener = listener;
             BaseUrl = baseUrl;
-            _responseChunks = responses;
+            _files = files;
             _serverTask = Task.Run(Serve);
         }
 
@@ -294,14 +295,14 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
             }
         }
 
-        public static Task<MockAndroidService> Start(IReadOnlyList<byte[]> responses)
+        public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files)
         {
             var port = GetFreePort();
             var baseUrl = $"http://127.0.0.1:{port}";
             var listener = new HttpListener();
             listener.Prefixes.Add($"{baseUrl}/");
             listener.Start();
-            return Task.FromResult(new MockAndroidService(listener, baseUrl, responses));
+            return Task.FromResult(new MockAndroidService(listener, baseUrl, files));
         }
 
         public async Task<AndroidRequest> GetSingleRequest()
@@ -343,6 +344,8 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
                     context.Request.Url?.AbsolutePath ?? "",
                     context.Request.Headers["Authorization"] ?? "",
                     context.Request.ContentType ?? "",
+                    context.Request.Headers["X-Remote-Executable"] ?? "",
+                    DecodeArgs(context.Request.Headers["X-Remote-Args"] ?? ""),
                     ParseQuery(context.Request.Url?.Query ?? ""),
                     0,
                     []);
@@ -354,14 +357,21 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
                 var requestIndex = RequestCount - 1;
                 var drainTask = DrainRequest(context.Request.InputStream, requestIndex);
                 context.Response.StatusCode = 200;
-                context.Response.ContentType = "video/MP2T";
+                var boundary = "test-boundary";
+                context.Response.ContentType = "multipart/mixed; boundary=" + boundary;
                 context.Response.SendChunked = true;
-                foreach (var responseChunk in _responseChunks)
+                foreach (var file in _files)
                 {
-                    await context.Response.OutputStream.WriteAsync(responseChunk);
+                    var partHeaders = Encoding.ASCII.GetBytes(
+                        $"--{boundary}\r\nContent-Type: application/octet-stream\r\nX-Remote-Event: upsert\r\nX-Remote-Path: {file.Key}\r\nContent-Length: {file.Value.Length}\r\n\r\n");
+                    await context.Response.OutputStream.WriteAsync(partHeaders);
+                    await context.Response.OutputStream.WriteAsync(file.Value);
+                    await context.Response.OutputStream.WriteAsync("\r\n"u8.ToArray());
                     await context.Response.OutputStream.FlushAsync();
                     await Task.Delay(10);
                 }
+                var exit = Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\nContent-Length: 14\r\n\r\n{{\"exitCode\":0}}\r\n--{boundary}--\r\n");
+                await context.Response.OutputStream.WriteAsync(exit);
                 await drainTask;
                 context.Response.Close();
             }
@@ -413,12 +423,25 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
                 .Select(part => part.Split('=', 2))
                 .ToDictionary(part => WebUtility.UrlDecode(part[0]), part => part.Length == 2 ? WebUtility.UrlDecode(part[1]) : "");
         }
+
+        private static string DecodeArgs(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return "";
+            }
+            value = value.Replace('-', '+').Replace('_', '/');
+            value = value.PadRight(value.Length + ((4 - value.Length % 4) % 4), '=');
+            return Encoding.UTF8.GetString(Convert.FromBase64String(value));
+        }
     }
 
     private sealed record AndroidRequest(
         string Path,
         string Authorization,
         string ContentType,
+        string Executable,
+        string RemoteArgs,
         IReadOnlyDictionary<string, string> Query,
         long BodyLength,
         byte[] BodyPrefix);

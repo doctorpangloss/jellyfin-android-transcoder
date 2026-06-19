@@ -17,6 +17,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Base64;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.After;
@@ -79,9 +80,10 @@ public final class TranscoderServiceInstrumentedTest {
     }
 
     @Test
-    public void testTranscodeEndpointRejectsMissingBearerToken() throws Exception {
+    public void testRemoteProcessEndpointRejectsMissingBearerToken() throws Exception {
         HttpResult result = request("POST",
-                "/api/v1/transcode?codec=h264&width=1920&height=1080&bitrate=6000000",
+                "/api/v1/remoteprocesses",
+                null,
                 null,
                 "fake-matroska".getBytes(StandardCharsets.UTF_8));
 
@@ -90,14 +92,18 @@ public final class TranscoderServiceInstrumentedTest {
     }
 
     @Test
-    public void testAuthorizedTranscodeEndpointAcceptsJellyfinStyleRequest() throws Exception {
+    public void testAuthorizedRemoteProcessEndpointAcceptsProcessRequest() throws Exception {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("X-Remote-Executable", "ffmpeg");
+        headers.put("X-Remote-Args", Base64.getUrlEncoder().withoutPadding().encodeToString(("[\"-version\"]").getBytes(StandardCharsets.UTF_8)));
         HttpResult result = request("POST",
-                "/api/v1/transcode?codec=h264&width=1920&height=1080&bitrate=6000000&maxrate=6000000&bufsize=12000000&gop=120&toneMap=1",
+                "/api/v1/remoteprocesses",
                 "Bearer " + AppConfig.token(context),
-                "not-a-real-video".getBytes(StandardCharsets.UTF_8));
+                headers,
+                new byte[0]);
 
         assertEquals(200, result.status);
-        assertEquals("video/MP2T", result.contentType);
+        assertTrue(result.contentType, result.contentType.startsWith("multipart/mixed"));
     }
 
     private void waitForStatus() throws Exception {
@@ -116,13 +122,18 @@ public final class TranscoderServiceInstrumentedTest {
         throw new AssertionError("Timed out waiting for Android transcoder service", last);
     }
 
-    private static HttpResult request(String method, String path, String authorization, byte[] body) throws Exception {
+    private static HttpResult request(String method, String path, String authorization, Map<String, String> headers, byte[] body) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL("http://127.0.0.1:" + AppConfig.PORT + path).openConnection();
         connection.setRequestMethod(method);
         connection.setConnectTimeout(3000);
         connection.setReadTimeout(15000);
         if (authorization != null) {
             connection.setRequestProperty("Authorization", authorization);
+        }
+        if (headers != null) {
+            for (Map.Entry<String, String> header : headers.entrySet()) {
+                connection.setRequestProperty(header.getKey(), header.getValue());
+            }
         }
         if (body != null) {
             connection.setDoOutput(true);
@@ -139,6 +150,10 @@ public final class TranscoderServiceInstrumentedTest {
         String responseBody = stream == null ? "" : readAll(stream);
         connection.disconnect();
         return new HttpResult(status, contentType, responseBody);
+    }
+
+    private static HttpResult request(String method, String path, String authorization, byte[] body) throws Exception {
+        return request(method, path, authorization, null, body);
     }
 
     private static String readAll(InputStream stream) throws Exception {

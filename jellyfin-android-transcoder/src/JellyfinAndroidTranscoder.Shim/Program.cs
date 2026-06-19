@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Text;
 
 namespace JellyfinAndroidTranscoder.Shim;
 
@@ -269,62 +270,194 @@ public static class AndroidTranscode
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
         using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        var uri = BuildUri(config, command, probe);
+        var uri = new Uri($"{config.AndroidBaseUrl.TrimEnd('/')}/api/v1/remoteprocesses");
         using var request = new HttpRequestMessage(HttpMethod.Post, uri);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
+        request.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
+        request.Headers.TryAddWithoutValidation("X-Remote-Args", EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)));
         await using var input = File.OpenRead(command.InputPath!);
         request.Content = new StreamContent(input);
-        request.Content.Headers.ContentType = new MediaTypeHeaderValue("video/x-matroska");
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
 
-        await using (var video = await response.Content.ReadAsStreamAsync())
+        var boundary = MultipartUtil.GetBoundary(response.Content.Headers.ContentType?.ToString()
+            ?? throw new InvalidOperationException("Missing multipart content type"));
+        await using (var files = await response.Content.ReadAsStreamAsync())
         {
-            await WriteSingleSegmentHls(command, video);
+            return await MultipartUtil.MaterializeFiles(files, boundary, command);
         }
-        return 0;
     }
 
-    private static Uri BuildUri(ShimConfig config, FfmpegCommand command, MediaProbe probe)
+    private static IReadOnlyList<string> BuildRemoteFfmpegArgs(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
         var toneMap = probe.IsHdr ? 1 : 0;
         var bitrate = Math.Min(command.MaxRate, config.MaxBitrate);
-        var query = $"codec=h264&width={command.Width}&height={command.Height}&bitrate={bitrate}&maxrate={bitrate}&bufsize={Math.Max(command.BufSize, bitrate * 2)}&gop={command.GopSeconds * 40}&toneMap={toneMap}";
-        return new Uri($"{config.AndroidBaseUrl.TrimEnd('/')}/api/v1/transcode?{query}");
+        var outputName = Path.GetFileName(command.OutputPath!);
+        var segmentName = Path.GetFileName(command.HlsSegmentFilename ?? Path.ChangeExtension(command.OutputPath!, ".ts"));
+        return
+        [
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
+            "-hwaccel", "mediacodec",
+            "-hwaccel_device", "mc",
+            "-hwaccel_output_format", "mediacodec",
+            "-i", "{input}",
+            "-map", "0:v:0",
+            "-c:v", "h264_mediacodec",
+            "-pix_fmt", "mediacodec",
+            "-output_width", command.Width.ToString(),
+            "-output_height", command.Height.ToString(),
+            "-surface_tonemap", toneMap.ToString(),
+            "-b:v", bitrate.ToString(),
+            "-maxrate", bitrate.ToString(),
+            "-bufsize", Math.Max(command.BufSize, bitrate * 2).ToString(),
+            "-bitrate_mode", "cbr",
+            "-g", (command.GopSeconds * 40).ToString(),
+            "-an",
+            "-sn",
+            "-dn",
+            "-f", "hls",
+            "-hls_time", Math.Max(command.GopSeconds, 1).ToString(),
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", "{outputRoot}/" + segmentName,
+            "-y", "{outputRoot}/" + outputName
+        ];
     }
 
-    private static async Task WriteSingleSegmentHls(FfmpegCommand command, Stream video)
+    private static string EncodeRemoteArgs(IReadOnlyList<string> args)
     {
-        var outputPath = command.OutputPath ?? throw new InvalidOperationException("Missing HLS output path");
-        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        var json = JsonSerializer.Serialize(args);
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(json))
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+    }
+}
 
-        var segmentPath = command.HlsSegmentFilename ?? Path.ChangeExtension(outputPath, ".ts");
-        segmentPath = segmentPath.Replace("%d", "0", StringComparison.Ordinal)
-            .Replace("%03d", "000", StringComparison.Ordinal)
-            .Replace("%05d", "00000", StringComparison.Ordinal);
-        if (!Path.IsPathRooted(segmentPath))
+public static class MultipartUtil
+{
+    public static string GetBoundary(string contentType)
+    {
+        var match = Regex.Match(contentType, "boundary=(?:\"([^\"]+)\"|([^;]+))", RegexOptions.IgnoreCase);
+        if (!match.Success)
         {
-            segmentPath = Path.Combine(Path.GetDirectoryName(outputPath)!, segmentPath);
+            throw new InvalidOperationException($"Missing multipart boundary in {contentType}");
         }
-        Directory.CreateDirectory(Path.GetDirectoryName(segmentPath)!);
+        return match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value.Trim();
+    }
 
-        await using (var segment = File.Create(segmentPath))
+    public static async Task<int> MaterializeFiles(Stream stream, string boundary, FfmpegCommand command)
+    {
+        var outputDirectory = Path.GetDirectoryName(command.OutputPath!)
+            ?? throw new InvalidOperationException("Missing output directory");
+        Directory.CreateDirectory(outputDirectory);
+        var exitCode = 0;
+        while (true)
         {
-            await video.CopyToAsync(segment);
-        }
+            var line = await ReadLine(stream);
+            if (line is null)
+            {
+                break;
+            }
+            if (line.Length == 0)
+            {
+                continue;
+            }
+            if (line == "--" + boundary + "--")
+            {
+                break;
+            }
+            if (line != "--" + boundary)
+            {
+                continue;
+            }
 
-        var segmentName = Path.GetFileName(segmentPath);
-        var targetDuration = Math.Max(command.GopSeconds, 1);
-        var playlist = string.Join('\n',
-            "#EXTM3U",
-            "#EXT-X-VERSION:3",
-            $"#EXT-X-TARGETDURATION:{targetDuration}",
-            "#EXT-X-MEDIA-SEQUENCE:0",
-            $"#EXTINF:{targetDuration}.000,",
-            segmentName,
-            "#EXT-X-ENDLIST",
-            "");
-        await File.WriteAllTextAsync(outputPath, playlist);
+            var headers = await ReadHeaders(stream);
+            var remoteEvent = Header(headers, "x-remote-event");
+            var contentLength = int.Parse(Header(headers, "content-length") ?? "0");
+            var body = await ReadExact(stream, contentLength);
+            await ReadLine(stream);
+            if (string.Equals(remoteEvent, "exit", StringComparison.OrdinalIgnoreCase))
+            {
+                using var document = JsonDocument.Parse(body);
+                exitCode = document.RootElement.GetProperty("exitCode").GetInt32();
+                continue;
+            }
+
+            var remotePath = Header(headers, "x-remote-path")
+                ?? throw new InvalidOperationException("Missing X-Remote-Path");
+            var localPath = ResolveLocalPath(outputDirectory, remotePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(localPath)!);
+            var temp = localPath + ".jfat.tmp";
+            await File.WriteAllBytesAsync(temp, body);
+            File.Move(temp, localPath, overwrite: true);
+        }
+        return exitCode;
+    }
+
+    private static string ResolveLocalPath(string outputDirectory, string remotePath)
+    {
+        var fileName = Path.GetFileName(remotePath.Replace('\\', '/'));
+        return Path.Combine(outputDirectory, fileName);
+    }
+
+    private static async Task<Dictionary<string, string>> ReadHeaders(Stream stream)
+    {
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string? line;
+        while (!string.IsNullOrEmpty(line = await ReadLine(stream)))
+        {
+            var colon = line.IndexOf(':');
+            if (colon > 0)
+            {
+                headers[line[..colon].Trim()] = line[(colon + 1)..].Trim();
+            }
+        }
+        return headers;
+    }
+
+    private static string? Header(Dictionary<string, string> headers, string name) =>
+        headers.TryGetValue(name, out var value) ? value : null;
+
+    private static async Task<byte[]> ReadExact(Stream stream, int length)
+    {
+        var buffer = new byte[length];
+        var offset = 0;
+        while (offset < length)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(offset, length - offset));
+            if (read == 0)
+            {
+                throw new EndOfStreamException();
+            }
+            offset += read;
+        }
+        return buffer;
+    }
+
+    private static async Task<string?> ReadLine(Stream stream)
+    {
+        using var bytes = new MemoryStream();
+        while (true)
+        {
+            var value = stream.ReadByte();
+            if (value < 0)
+            {
+                return bytes.Length == 0 ? null : Encoding.ASCII.GetString(bytes.ToArray());
+            }
+            if (value == '\n')
+            {
+                var line = bytes.ToArray();
+                if (line.Length > 0 && line[^1] == '\r')
+                {
+                    line = line[..^1];
+                }
+                return Encoding.ASCII.GetString(line);
+            }
+            bytes.WriteByte((byte)value);
+        }
     }
 }
 

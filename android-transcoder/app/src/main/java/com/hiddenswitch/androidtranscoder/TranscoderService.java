@@ -10,6 +10,7 @@ import android.os.IBinder;
 import android.util.Log;
 
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -22,11 +23,17 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -121,8 +128,8 @@ public class TranscoderService extends Service {
                 writeText(out, 401, "unauthorized\n");
                 return;
             }
-            if (request.path.equals("/api/v1/transcode") && request.method.equals("POST")) {
-                transcode(request, in, out);
+            if (request.path.equals("/api/v1/remoteprocesses") && request.method.equals("POST")) {
+                remoteProcess(request, in, out);
                 return;
             }
             writeText(out, 404, "not found\n");
@@ -152,103 +159,67 @@ public class TranscoderService extends Service {
         obj.put("ffmpegPath", AppConfig.ffmpegPath(this));
         obj.put("tokenRequired", true);
         obj.put("capabilities", new JSONObject()
-                .put("input", "matroska")
-                .put("output", "mpegts")
-                .put("videoCodec", "h264")
+                .put("api", "remoteprocesses")
+                .put("output", "multipart/mixed")
+                .put("executables", new JSONArray().put("ffmpeg"))
                 .put("hardware", "mediacodec-gles"));
         return obj;
     }
 
-    private void transcode(Request request, InputStream requestBody, OutputStream response) throws Exception {
+    private void remoteProcess(Request request, InputStream requestBody, OutputStream response) throws Exception {
         if (!ACTIVE_JOBS.compareAndSet(0, 1)) {
             writeText(response, 429, "busy\n");
             return;
         }
         Process process = null;
+        File workDir = new File(getCacheDir(), "remoteprocesses/" + UUID.randomUUID());
         try {
             ACCEPTED_JOBS.incrementAndGet();
-            List<String> command = ffmpegCommand(request.query);
+            File outputDir = new File(workDir, "out");
+            if (!outputDir.mkdirs() && !outputDir.isDirectory()) {
+                throw new IOException("Failed to create " + outputDir);
+            }
+            List<String> command = remoteProcessCommand(request, outputDir);
             process = new ProcessBuilder(command).redirectErrorStream(false).start();
-            Process ffmpeg = process;
-            Thread stdin = new Thread(() -> pipeRequestBody(request, requestBody, ffmpeg), "ffmpeg-stdin");
-            Thread stderr = new Thread(() -> logStream(ffmpeg.getErrorStream()), "ffmpeg-stderr");
+            Process child = process;
+            Thread stdin = new Thread(() -> pipeRequestBody(request, requestBody, child), "remoteprocess-stdin");
+            Thread stdout = new Thread(() -> drainStream(child.getInputStream()), "remoteprocess-stdout");
+            Thread stderr = new Thread(() -> logStream(child.getErrorStream()), "remoteprocess-stderr");
             stdin.start();
+            stdout.start();
             stderr.start();
 
-            writeHeaders(response, 200, "video/MP2T", true);
-            pipeChunked(ffmpeg.getInputStream(), response);
+            int exit = streamMultipartFiles(response, outputDir, child);
             stdin.join();
+            stdout.join();
             stderr.join();
-            if (!ffmpeg.waitFor(120, TimeUnit.SECONDS)) {
-                ffmpeg.destroyForcibly();
-                throw new IOException("ffmpeg timed out");
+            if (exit == 0) {
+                COMPLETED_JOBS.incrementAndGet();
             }
-            int exit = ffmpeg.exitValue();
-            if (exit != 0) {
-                throw new IOException("ffmpeg exited " + exit);
-            }
-            COMPLETED_JOBS.incrementAndGet();
         } finally {
             if (process != null) {
                 process.destroyForcibly();
             }
+            deleteRecursively(workDir);
             ACTIVE_JOBS.set(0);
         }
     }
 
-    private List<String> ffmpegCommand(Map<String, String> query) {
-        String width = query.getOrDefault("width", "1920");
-        String height = query.getOrDefault("height", "1080");
-        String bitrate = query.getOrDefault("bitrate", "6000000");
-        String maxrate = query.getOrDefault("maxrate", bitrate);
-        String bufsize = query.getOrDefault("bufsize", "12000000");
-        String gop = query.getOrDefault("gop", "120");
-        String toneMap = query.getOrDefault("toneMap", "0");
-
-        List<String> args = new ArrayList<>();
-        args.add(AppConfig.ffmpegPath(this));
-        args.add("-hide_banner");
-        args.add("-loglevel");
-        args.add("warning");
-        args.add("-init_hw_device");
-        args.add("mediacodec=mc,create_window=1,surface_processor=1");
-        args.add("-hwaccel");
-        args.add("mediacodec");
-        args.add("-hwaccel_device");
-        args.add("mc");
-        args.add("-hwaccel_output_format");
-        args.add("mediacodec");
-        args.add("-i");
-        args.add("pipe:0");
-        args.add("-map");
-        args.add("0:v:0");
-        args.add("-c:v");
-        args.add("h264_mediacodec");
-        args.add("-pix_fmt");
-        args.add("mediacodec");
-        args.add("-output_width");
-        args.add(width);
-        args.add("-output_height");
-        args.add(height);
-        args.add("-surface_tonemap");
-        args.add(toneMap);
-        args.add("-b:v");
-        args.add(bitrate);
-        args.add("-maxrate");
-        args.add(maxrate);
-        args.add("-bufsize");
-        args.add(bufsize);
-        args.add("-bitrate_mode");
-        args.add("cbr");
-        args.add("-g");
-        args.add(gop);
-        args.add("-an");
-        args.add("-sn");
-        args.add("-dn");
-        args.add("-f");
-        args.add("mpegts");
-        args.add("pipe:1");
-        return args;
+    private List<String> remoteProcessCommand(Request request, File outputDir) throws Exception {
+        String executable = request.headers.getOrDefault("x-remote-executable", "");
+        if (!"ffmpeg".equals(executable)) {
+            throw new IOException("unsupported executable: " + executable);
+        }
+        JSONArray jsonArgs = new JSONArray(new String(Base64.getUrlDecoder().decode(
+                request.headers.getOrDefault("x-remote-args", "")), StandardCharsets.UTF_8));
+        List<String> command = new ArrayList<>();
+        command.add(AppConfig.ffmpegPath(this));
+        for (int i = 0; i < jsonArgs.length(); i++) {
+            command.add(jsonArgs.getString(i)
+                    .replace("{input}", "pipe:0")
+                    .replace("{outputRoot}", outputDir.getAbsolutePath()));
+        }
+        return command;
     }
 
     private void pipeRequestBody(Request request, InputStream in, Process process) {
@@ -260,6 +231,15 @@ public class TranscoderService extends Service {
                 copyFixed(in, stdin, length);
             }
         } catch (Exception ignored) {
+        }
+    }
+
+    private static void drainStream(InputStream in) {
+        try {
+            byte[] buffer = new byte[65536];
+            while (in.read(buffer) >= 0) {
+            }
+        } catch (IOException ignored) {
         }
     }
 
@@ -294,6 +274,130 @@ public class TranscoderService extends Service {
         headers.append("Connection: close\r\n\r\n");
         out.write(headers.toString().getBytes(StandardCharsets.US_ASCII));
         out.flush();
+    }
+
+    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process) throws IOException, InterruptedException {
+        String boundary = "jfat-" + UUID.randomUUID();
+        writeHeaders(out, 200, "multipart/mixed; boundary=" + boundary, true);
+        Map<String, FileSnapshot> observed = new HashMap<>();
+        Set<String> sent = new HashSet<>();
+        while (process.isAlive()) {
+            streamStableFiles(out, outputDir, boundary, observed, sent);
+            Thread.sleep(100);
+        }
+        if (!process.waitFor(120, TimeUnit.SECONDS)) {
+            process.destroyForcibly();
+            throw new IOException("remote process timed out");
+        }
+        int exitCode = process.exitValue();
+        for (int i = 0; i < 5; i++) {
+            streamStableFiles(out, outputDir, boundary, observed, sent);
+            Thread.sleep(100);
+        }
+        writeExitPart(out, boundary, exitCode);
+        return exitCode;
+    }
+
+    private static void streamStableFiles(OutputStream out, File outputDir, String boundary, Map<String, FileSnapshot> observed, Set<String> sent) throws IOException {
+        for (File file : listFiles(outputDir)) {
+            String relative = outputDir.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/');
+            FileSnapshot snapshot = new FileSnapshot(file.length(), file.lastModified());
+            FileSnapshot previous = observed.put(relative, snapshot);
+            if (!snapshot.equals(previous)) {
+                continue;
+            }
+            String signature = relative + ":" + snapshot.length + ":" + snapshot.lastModified;
+            if (!sent.add(signature)) {
+                continue;
+            }
+            writeFilePart(out, boundary, outputDir, file, relative);
+        }
+    }
+
+    private static void writeFilePart(OutputStream out, String boundary, File outputDir, File file, String relative) throws IOException {
+        ByteArrayOutputStream part = new ByteArrayOutputStream();
+        part.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.US_ASCII));
+        part.write("Content-Type: application/octet-stream\r\n".getBytes(StandardCharsets.US_ASCII));
+        part.write(("Content-Disposition: attachment; filename=\"" + relative + "\"\r\n").getBytes(StandardCharsets.US_ASCII));
+        part.write(("X-Remote-Path: " + relative + "\r\n").getBytes(StandardCharsets.US_ASCII));
+        part.write("X-Remote-Event: upsert\r\n".getBytes(StandardCharsets.US_ASCII));
+        part.write(("Content-Length: " + file.length() + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        Files.copy(file.toPath(), part);
+        part.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+        writeChunk(out, part.toByteArray());
+    }
+
+    private static void writeExitPart(OutputStream out, String boundary, int exitCode) throws IOException {
+        byte[] finalPart = ("--" + boundary + "\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\n\r\n{\"exitCode\":" + exitCode + "}\r\n--" + boundary + "--\r\n")
+                .getBytes(StandardCharsets.US_ASCII);
+        writeChunk(out, finalPart);
+        out.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+    }
+
+    private static void writeChunk(OutputStream out, byte[] bytes) throws IOException {
+        out.write(Integer.toHexString(bytes.length).getBytes(StandardCharsets.US_ASCII));
+        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+        out.write(bytes);
+        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+    }
+
+    private static List<File> listFiles(File directory) {
+        List<File> result = new ArrayList<>();
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return result;
+        }
+        for (File file : files) {
+            if (file.isDirectory()) {
+                result.addAll(listFiles(file));
+            } else {
+                result.add(file);
+            }
+        }
+        result.sort(Comparator.comparing(File::getAbsolutePath));
+        return result;
+    }
+
+    private static void deleteRecursively(File file) {
+        if (file == null || !file.exists()) {
+            return;
+        }
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    deleteRecursively(child);
+                }
+            }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        file.delete();
+    }
+
+    private static final class FileSnapshot {
+        final long length;
+        final long lastModified;
+
+        FileSnapshot(long length, long lastModified) {
+            this.length = length;
+            this.lastModified = lastModified;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (!(obj instanceof FileSnapshot)) {
+                return false;
+            }
+            FileSnapshot other = (FileSnapshot) obj;
+            return length == other.length && lastModified == other.lastModified;
+        }
+
+        @Override
+        public int hashCode() {
+            return (int) (length ^ (length >>> 32) ^ lastModified ^ (lastModified >>> 32));
+        }
     }
 
     private static void pipeChunked(InputStream in, OutputStream out) throws IOException {
