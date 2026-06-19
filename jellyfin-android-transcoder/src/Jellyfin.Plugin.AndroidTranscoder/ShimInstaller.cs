@@ -16,6 +16,7 @@ internal static class ShimInstaller
         Directory.CreateDirectory(Path.GetDirectoryName(config.ShimPath)!);
         File.Copy(source, config.ShimPath, overwrite: true);
         MakeExecutable(config.ShimPath);
+        InstallFfprobeWrapper(config);
         WriteShimConfig(config);
     }
 
@@ -37,6 +38,24 @@ internal static class ShimInstaller
     {
         var plugin = Plugin.Instance ?? throw new InvalidOperationException("Plugin is not initialized");
         return Path.Combine(Path.GetDirectoryName(plugin.AssemblyFilePath) ?? plugin.DataFolderPath, "shim-payload", "jfat-ffmpeg");
+    }
+
+    private static void InstallFfprobeWrapper(PluginConfiguration config)
+    {
+        var shimDirectory = Path.GetDirectoryName(config.ShimPath)
+            ?? throw new InvalidOperationException("Shim path must include a directory");
+        Directory.CreateDirectory(shimDirectory);
+
+        var path = Path.Combine(shimDirectory, OperatingSystem.IsWindows() ? "ffprobe.cmd" : "ffprobe");
+        if (OperatingSystem.IsWindows())
+        {
+            File.WriteAllText(path, $"@echo off\r\n\"{config.RealFfprobePath}\" %*\r\n");
+            return;
+        }
+
+        var escapedFfprobe = config.RealFfprobePath.Replace("'", "'\"'\"'", StringComparison.Ordinal);
+        File.WriteAllText(path, $"#!/usr/bin/env sh\nexec '{escapedFfprobe}' \"$@\"\n");
+        MakeExecutable(path);
     }
 
     private static void MakeExecutable(string path)
