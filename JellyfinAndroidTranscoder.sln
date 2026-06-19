@@ -1,0 +1,47 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "jellyfin-android-transcoder", "jellyfin-android-transcoder", "{6684752C-FD0D-4F8D-AA71-55FAA9CCD7F8}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{5CB64BF0-BDC5-42B5-A728-2D6857F02C49}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JellyfinAndroidTranscoder.Shim", "jellyfin-android-transcoder\src\JellyfinAndroidTranscoder.Shim\JellyfinAndroidTranscoder.Shim.csproj", "{396AAEEB-7B78-4922-9956-48DE01210393}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Jellyfin.Plugin.AndroidTranscoder", "jellyfin-android-transcoder\src\Jellyfin.Plugin.AndroidTranscoder\Jellyfin.Plugin.AndroidTranscoder.csproj", "{318FECFD-498A-4F77-8C6C-C296FBBEEB15}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{3F0858E1-198D-4DC1-85C8-AB2D9516B096}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JellyfinAndroidTranscoder.Shim.Tests", "jellyfin-android-transcoder\tests\JellyfinAndroidTranscoder.Shim.Tests\JellyfinAndroidTranscoder.Shim.Tests.csproj", "{241EDA80-3063-48D3-8800-117961F6DE3A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{396AAEEB-7B78-4922-9956-48DE01210393}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{396AAEEB-7B78-4922-9956-48DE01210393}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{396AAEEB-7B78-4922-9956-48DE01210393}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{396AAEEB-7B78-4922-9956-48DE01210393}.Release|Any CPU.Build.0 = Release|Any CPU
+		{318FECFD-498A-4F77-8C6C-C296FBBEEB15}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{318FECFD-498A-4F77-8C6C-C296FBBEEB15}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{318FECFD-498A-4F77-8C6C-C296FBBEEB15}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{318FECFD-498A-4F77-8C6C-C296FBBEEB15}.Release|Any CPU.Build.0 = Release|Any CPU
+		{241EDA80-3063-48D3-8800-117961F6DE3A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{241EDA80-3063-48D3-8800-117961F6DE3A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{241EDA80-3063-48D3-8800-117961F6DE3A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{241EDA80-3063-48D3-8800-117961F6DE3A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{5CB64BF0-BDC5-42B5-A728-2D6857F02C49} = {6684752C-FD0D-4F8D-AA71-55FAA9CCD7F8}
+		{396AAEEB-7B78-4922-9956-48DE01210393} = {5CB64BF0-BDC5-42B5-A728-2D6857F02C49}
+		{318FECFD-498A-4F77-8C6C-C296FBBEEB15} = {5CB64BF0-BDC5-42B5-A728-2D6857F02C49}
+		{3F0858E1-198D-4DC1-85C8-AB2D9516B096} = {6684752C-FD0D-4F8D-AA71-55FAA9CCD7F8}
+		{241EDA80-3063-48D3-8800-117961F6DE3A} = {3F0858E1-198D-4DC1-85C8-AB2D9516B096}
+	EndGlobalSection
+EndGlobal

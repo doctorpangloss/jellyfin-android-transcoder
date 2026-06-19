@@ -1,0 +1,11 @@
+.DS_Store
+.idea/
+*.user
+*.suo
+**/bin/
+**/obj/
+**/.gradle/
+**/build/
+android-transcoder/local.properties
+android-transcoder/app/release/
+android-transcoder/app/debug/
