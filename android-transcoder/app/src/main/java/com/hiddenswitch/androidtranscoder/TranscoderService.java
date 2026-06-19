@@ -38,6 +38,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class TranscoderService extends Service {
     private static final String CHANNEL = "transcoder";
@@ -45,6 +46,7 @@ public class TranscoderService extends Service {
     private static final AtomicInteger ACTIVE_JOBS = new AtomicInteger();
     private static final AtomicInteger ACCEPTED_JOBS = new AtomicInteger();
     private static final AtomicInteger COMPLETED_JOBS = new AtomicInteger();
+    private static final AtomicLong INPUT_BYTES = new AtomicLong();
     private static volatile boolean running;
 
     private ExecutorService executor;
@@ -155,6 +157,7 @@ public class TranscoderService extends Service {
         obj.put("activeJobs", ACTIVE_JOBS.get());
         obj.put("acceptedJobs", ACCEPTED_JOBS.get());
         obj.put("completedJobs", COMPLETED_JOBS.get());
+        obj.put("inputBytes", INPUT_BYTES.get());
         obj.put("maxJobs", 1);
         obj.put("ffmpegPath", AppConfig.ffmpegPath(this));
         obj.put("tokenRequired", true);
@@ -457,6 +460,7 @@ public class TranscoderService extends Service {
                 break;
             }
             out.write(buffer, 0, read);
+            INPUT_BYTES.addAndGet(read);
             remaining -= read;
         }
     }
