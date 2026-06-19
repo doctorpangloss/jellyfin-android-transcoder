@@ -110,6 +110,7 @@ public sealed class FfmpegCommand
             hlsStart = IndexOf(args, "-f");
         }
 
+        var scaleWidth = ParseScaleWidth(ValueAfter(args, "-vf"));
         return new FfmpegCommand
         {
             Args = args.ToArray(),
@@ -117,8 +118,8 @@ public sealed class FfmpegCommand
             OutputPath = output,
             MaxRate = ParseBitrate(ValueAfter(args, "-maxrate"), 6_000_000),
             BufSize = ParseBitrate(ValueAfter(args, "-bufsize"), 12_000_000),
-            Width = ParseScaleWidth(ValueAfter(args, "-vf")) ?? 1920,
-            Height = ParseScaleHeight(ValueAfter(args, "-vf")) ?? 1080,
+            Width = scaleWidth ?? 1920,
+            Height = ParseScaleHeight(ValueAfter(args, "-vf"), scaleWidth) ?? 1080,
             GopSeconds = ParseForceKeySeconds(ValueAfter(args, "-force_key_frames:0")) ?? 3,
             AudioCodec = ValueAfter(args, "-codec:a:0") ?? "copy",
             AudioBitrate = ValueAfter(args, "-ab"),
@@ -183,11 +184,15 @@ public sealed class FfmpegCommand
         return match.Success ? int.Parse(match.Groups[1].Value) : null;
     }
 
-    private static int? ParseScaleHeight(string? vf)
+    private static int? ParseScaleHeight(string? vf, int? width)
     {
         if (vf is null)
         {
             return null;
+        }
+        if (width is not null)
+        {
+            return width.Value / 16 * 9;
         }
         return vf.Contains("1920", StringComparison.Ordinal) ? 1080 : null;
     }
