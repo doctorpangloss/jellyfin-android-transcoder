@@ -9,7 +9,10 @@ namespace JellyfinAndroidTranscoder.Shim.Tests;
 
 public sealed class AndroidBridgeIntegrationTests : IDisposable
 {
-    private readonly string _tempDir = Path.Combine(Path.GetTempPath(), $"jfat-tests-{Guid.NewGuid():N}");
+    private static readonly SemaphoreSlim PublishLock = new(1, 1);
+    private static string? s_shimExecutable;
+
+    private readonly string _tempDir = Path.Combine(RepositoryRoot(), ".work", "shim-tests", Guid.NewGuid().ToString("N"));
     private readonly string? _previousConfig = Environment.GetEnvironmentVariable("JFAT_CONFIG");
 
     public AndroidBridgeIntegrationTests()
@@ -56,7 +59,8 @@ JSON
         Assert.Equal("/api/v1/transcode", request.Path);
         Assert.Equal("Bearer test-token", request.Authorization);
         Assert.Equal("video/x-matroska", request.ContentType);
-        Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.Body));
+        Assert.Equal("placeholder-matroska".Length, request.BodyLength);
+        Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
         Assert.Equal("h264", request.Query["codec"]);
         Assert.Equal("1920", request.Query["width"]);
         Assert.Equal("1080", request.Query["height"]);
@@ -65,6 +69,54 @@ JSON
         Assert.Equal("120", request.Query["gop"]);
         Assert.Equal("1", request.Query["toneMap"]);
 
+    }
+
+    [Fact]
+    public async Task JellyfinStyleTranscodeExecutableCreatesHlsFilesLikeFfmpeg()
+    {
+        var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}]}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "process-ffmpeg.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("streaming-input-", 1024)));
+        var output = Path.Combine(_tempDir, "playlist.m3u8");
+
+        await using var android = await MockAndroidService.Start([
+            "mpegts-chunk-a"u8.ToArray(),
+            "mpegts-chunk-b"u8.ToArray()
+        ]);
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var shimExecutable = await BuildShimExecutable();
+        using var process = ProcessUtil.Start(shimExecutable, JellyfinArgs(input, output), redirectInput: false, redirectOutput: false);
+        await process.WaitForExitAsync();
+
+        Assert.Equal(0, process.ExitCode);
+        Assert.Equal("", await File.ReadAllTextAsync(ffmpegLog));
+
+        var segment = Path.Combine(_tempDir, "segment0.ts");
+        Assert.True(File.Exists(output), "The shim must create Jellyfin's requested HLS playlist path.");
+        Assert.True(File.Exists(segment), "The shim must create Jellyfin's requested HLS segment path.");
+        Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
+        Assert.Equal("mpegts-chunk-ampegts-chunk-b", await File.ReadAllTextAsync(segment));
+
+        var request = await android.GetSingleRequest();
+        Assert.Equal(File.ReadAllText(input).Length, request.BodyLength);
+        Assert.StartsWith("streaming-input-", Encoding.UTF8.GetString(request.BodyPrefix));
     }
 
     [Fact]
@@ -148,10 +200,76 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
         "-y", output
     ];
 
+    private static async Task<string> BuildShimExecutable()
+    {
+        if (s_shimExecutable is not null)
+        {
+            return s_shimExecutable;
+        }
+
+        await PublishLock.WaitAsync();
+        try
+        {
+            if (s_shimExecutable is not null)
+            {
+                return s_shimExecutable;
+            }
+
+            var root = RepositoryRoot();
+            var output = Path.Combine(root, ".work", "shim-contract", "publish");
+            Directory.CreateDirectory(output);
+
+            var project = Path.Combine(
+                root,
+                "jellyfin-android-transcoder",
+                "src",
+                "JellyfinAndroidTranscoder.Shim",
+                "JellyfinAndroidTranscoder.Shim.csproj");
+            var publish = ProcessUtil.Start(
+                "dotnet",
+                ["publish", project, "--configuration", "Debug", "--output", output, "--nologo"],
+                redirectInput: false,
+                redirectOutput: false);
+            await publish.WaitForExitAsync();
+            if (publish.ExitCode != 0)
+            {
+                throw new InvalidOperationException($"dotnet publish failed with exit code {publish.ExitCode}");
+            }
+
+            var executable = Path.Combine(output, OperatingSystem.IsWindows() ? "jfat-ffmpeg.exe" : "jfat-ffmpeg");
+            if (!File.Exists(executable))
+            {
+                throw new FileNotFoundException("The shim publish did not produce an executable apphost.", executable);
+            }
+
+            s_shimExecutable = executable;
+            return executable;
+        }
+        finally
+        {
+            PublishLock.Release();
+        }
+    }
+
+    private static string RepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "JellyfinAndroidTranscoder.sln")))
+            {
+                return directory.FullName;
+            }
+            directory = directory.Parent;
+        }
+
+        throw new InvalidOperationException("Could not locate the jellyfin-android-transcoder repository root.");
+    }
+
     private sealed class MockAndroidService : IAsyncDisposable
     {
         private readonly HttpListener _listener;
-        private readonly IReadOnlyList<byte[]> _responses;
+        private readonly IReadOnlyList<byte[]> _responseChunks;
         private readonly List<AndroidRequest> _requests = [];
         private readonly Task _serverTask;
 
@@ -159,7 +277,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
         {
             _listener = listener;
             BaseUrl = baseUrl;
-            _responses = responses;
+            _responseChunks = responses;
             _serverTask = Task.Run(Serve);
         }
 
@@ -221,25 +339,58 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
             while (_listener.IsListening)
             {
                 var context = await _listener.GetContextAsync();
-                await using var body = new MemoryStream();
-                await context.Request.InputStream.CopyToAsync(body);
                 var request = new AndroidRequest(
                     context.Request.Url?.AbsolutePath ?? "",
                     context.Request.Headers["Authorization"] ?? "",
                     context.Request.ContentType ?? "",
                     ParseQuery(context.Request.Url?.Query ?? ""),
-                    body.ToArray());
+                    0,
+                    []);
                 lock (_requests)
                 {
                     _requests.Add(request);
                 }
 
-                var responseBody = _responses[Math.Min(_requests.Count - 1, _responses.Count - 1)];
+                var requestIndex = RequestCount - 1;
+                var drainTask = DrainRequest(context.Request.InputStream, requestIndex);
                 context.Response.StatusCode = 200;
                 context.Response.ContentType = "video/MP2T";
-                context.Response.ContentLength64 = responseBody.Length;
-                await context.Response.OutputStream.WriteAsync(responseBody);
+                context.Response.SendChunked = true;
+                foreach (var responseChunk in _responseChunks)
+                {
+                    await context.Response.OutputStream.WriteAsync(responseChunk);
+                    await context.Response.OutputStream.FlushAsync();
+                    await Task.Delay(10);
+                }
+                await drainTask;
                 context.Response.Close();
+            }
+        }
+
+        private async Task DrainRequest(Stream input, int requestIndex)
+        {
+            var buffer = new byte[8192];
+            await using var prefix = new MemoryStream();
+            long total = 0;
+            int read;
+            while ((read = await input.ReadAsync(buffer)) > 0)
+            {
+                total += read;
+                if (prefix.Length < 4096)
+                {
+                    var take = (int)Math.Min(read, 4096 - prefix.Length);
+                    await prefix.WriteAsync(buffer.AsMemory(0, take));
+                }
+            }
+
+            lock (_requests)
+            {
+                var request = _requests[requestIndex];
+                _requests[requestIndex] = request with
+                {
+                    BodyLength = total,
+                    BodyPrefix = prefix.ToArray()
+                };
             }
         }
 
@@ -269,5 +420,6 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
         string Authorization,
         string ContentType,
         IReadOnlyDictionary<string, string> Query,
-        byte[] Body);
+        long BodyLength,
+        byte[] BodyPrefix);
 }
