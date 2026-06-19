@@ -51,8 +51,8 @@ build_one() {
     --strip=llvm-strip \
     --sysroot="$TOOLCHAIN/sysroot" \
     --enable-cross-compile \
-    --disable-static \
-    --enable-shared \
+    --enable-static \
+    --disable-shared \
     --disable-symver \
     --disable-doc \
     --disable-debug \
@@ -78,8 +78,6 @@ build_one() {
   PATH="$TOOLCHAIN/bin:$PATH" make -j"$JOBS" ffmpeg
   PATH="$TOOLCHAIN/bin:$PATH" llvm-strip ffmpeg
   install -m 0755 ffmpeg "$OUT_DIR/$abi/libffmpeg.so"
-  find . -path './lib*/*.so' -type l -exec cp -L {} "$OUT_DIR/$abi/" \;
-  find "$OUT_DIR/$abi" -maxdepth 1 -type f -name 'lib*.so*' ! -name libffmpeg.so -exec "$TOOLCHAIN/bin/llvm-strip" {} \;
   popd >/dev/null
 }
 

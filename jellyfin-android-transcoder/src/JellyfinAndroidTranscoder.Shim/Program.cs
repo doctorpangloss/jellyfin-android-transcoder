@@ -76,6 +76,7 @@ public sealed class FfmpegCommand
     public string? AudioBitrate { get; init; }
     public string? AudioChannels { get; init; }
     public string? AudioFilter { get; init; }
+    public string? HlsSegmentFilename { get; init; }
     public IReadOnlyList<string> HlsArgs { get; init; } = Array.Empty<string>();
 
     public bool CanConsiderRouting =>
@@ -116,6 +117,7 @@ public sealed class FfmpegCommand
             AudioBitrate = ValueAfter(args, "-ab"),
             AudioChannels = ValueAfter(args, "-ac"),
             AudioFilter = ValueAfter(args, "-af"),
+            HlsSegmentFilename = ValueAfter(args, "-hls_segment_filename"),
             HlsArgs = hlsStart >= 0 ? args.Skip(hlsStart).Take(args.Count - hlsStart - 1).ToArray() : Array.Empty<string>()
         };
     }
@@ -260,29 +262,21 @@ public static class AndroidTranscode
 {
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
-        var producer = StartProducer(config.RealFfmpegPath, command.InputPath!);
-        await using var producerGuard = new ProcessGuard(producer);
-
         using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         var uri = BuildUri(config, command, probe);
         using var request = new HttpRequestMessage(HttpMethod.Post, uri);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
-        request.Content = new StreamContent(producer.StandardOutput.BaseStream);
+        await using var input = File.OpenRead(command.InputPath!);
+        request.Content = new StreamContent(input);
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("video/x-matroska");
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
 
-        var packager = StartPackager(config.RealFfmpegPath, command);
-        await using var packagerGuard = new ProcessGuard(packager);
         await using (var video = await response.Content.ReadAsStreamAsync())
         {
-            await video.CopyToAsync(packager.StandardInput.BaseStream);
-            packager.StandardInput.Close();
+            await WriteSingleSegmentHls(command, video);
         }
-
-        var producerExit = await producer.WaitForExitAsync().ContinueWith(_ => producer.ExitCode);
-        var packagerExit = await packager.WaitForExitAsync().ContinueWith(_ => packager.ExitCode);
-        return producerExit == 0 ? packagerExit : producerExit;
+        return 0;
     }
 
     private static Uri BuildUri(ShimConfig config, FfmpegCommand command, MediaProbe probe)
@@ -293,42 +287,38 @@ public static class AndroidTranscode
         return new Uri($"{config.AndroidBaseUrl.TrimEnd('/')}/api/v1/transcode?{query}");
     }
 
-    private static Process StartProducer(string ffmpegPath, string inputPath)
+    private static async Task WriteSingleSegmentHls(FfmpegCommand command, Stream video)
     {
-        var args = new[] { "-hide_banner", "-loglevel", "warning", "-i", $"file:{inputPath}", "-map", "0:v:0", "-c", "copy", "-f", "matroska", "pipe:1" };
-        return ProcessUtil.Start(ffmpegPath, args, redirectInput: false, redirectOutput: true);
-    }
+        var outputPath = command.OutputPath ?? throw new InvalidOperationException("Missing HLS output path");
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
-    private static Process StartPackager(string ffmpegPath, FfmpegCommand command)
-    {
-        var args = new List<string>
+        var segmentPath = command.HlsSegmentFilename ?? Path.ChangeExtension(outputPath, ".ts");
+        segmentPath = segmentPath.Replace("%d", "0", StringComparison.Ordinal)
+            .Replace("%03d", "000", StringComparison.Ordinal)
+            .Replace("%05d", "00000", StringComparison.Ordinal);
+        if (!Path.IsPathRooted(segmentPath))
         {
-            "-hide_banner", "-loglevel", "warning",
-            "-i", "pipe:0",
-            "-i", $"file:{command.InputPath}",
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-map", "0:v:0",
-            "-map", "1:a:0?",
-            "-map", "-1:s",
-            "-codec:v:0", "copy",
-            "-codec:a:0", command.AudioCodec
-        };
-        if (command.AudioChannels is not null)
-        {
-            args.AddRange(["-ac", command.AudioChannels]);
+            segmentPath = Path.Combine(Path.GetDirectoryName(outputPath)!, segmentPath);
         }
-        if (command.AudioBitrate is not null)
+        Directory.CreateDirectory(Path.GetDirectoryName(segmentPath)!);
+
+        await using (var segment = File.Create(segmentPath))
         {
-            args.AddRange(["-ab", command.AudioBitrate]);
+            await video.CopyToAsync(segment);
         }
-        if (command.AudioFilter is not null)
-        {
-            args.AddRange(["-af", command.AudioFilter]);
-        }
-        args.AddRange(command.HlsArgs);
-        args.Add(command.OutputPath!);
-        return ProcessUtil.Start(ffmpegPath, args, redirectInput: true, redirectOutput: false);
+
+        var segmentName = Path.GetFileName(segmentPath);
+        var targetDuration = Math.Max(command.GopSeconds, 1);
+        var playlist = string.Join('\n',
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            $"#EXT-X-TARGETDURATION:{targetDuration}",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            $"#EXTINF:{targetDuration}.000,",
+            segmentName,
+            "#EXT-X-ENDLIST",
+            "");
+        await File.WriteAllTextAsync(outputPath, playlist);
     }
 }
 

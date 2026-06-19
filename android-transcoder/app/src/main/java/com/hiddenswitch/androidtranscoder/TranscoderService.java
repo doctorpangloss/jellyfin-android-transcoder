@@ -152,9 +152,7 @@ public class TranscoderService extends Service {
         Process process = null;
         try {
             List<String> command = ffmpegCommand(request.query);
-            ProcessBuilder processBuilder = new ProcessBuilder(command).redirectErrorStream(false);
-            processBuilder.environment().put("LD_LIBRARY_PATH", getApplicationInfo().nativeLibraryDir);
-            process = processBuilder.start();
+            process = new ProcessBuilder(command).redirectErrorStream(false).start();
             Process ffmpeg = process;
             Thread stdin = new Thread(() -> pipeRequestBody(request, requestBody, ffmpeg), "ffmpeg-stdin");
             Thread stderr = new Thread(() -> drain(ffmpeg.getErrorStream()), "ffmpeg-stderr");

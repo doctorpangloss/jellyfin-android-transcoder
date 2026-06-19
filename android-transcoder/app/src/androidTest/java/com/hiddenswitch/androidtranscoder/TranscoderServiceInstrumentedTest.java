@@ -15,6 +15,8 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.After;
@@ -23,6 +25,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 @RunWith(AndroidJUnit4.class)
@@ -55,6 +58,24 @@ public final class TranscoderServiceInstrumentedTest {
         assertTrue(result.body.contains("\"HiddenSwitch Android Transcoder\""));
         assertTrue(result.body.contains("\"hardware\":\"mediacodec-gles\""));
         assertTrue(result.body.contains("\"tokenRequired\":true"));
+    }
+
+    @Test
+    public void testBundledFfmpegExecutesFromNormalAppContext() throws Exception {
+        ExecResult result = execFfmpegVersion();
+
+        assertEquals(result.stderr, 0, result.exitCode);
+        assertTrue(result.stdout, result.stdout.startsWith("ffmpeg version"));
+        assertFalse(result.stdout, result.stdout.contains("CANNOT LINK EXECUTABLE"));
+    }
+
+    @Test
+    public void testBundledFfmpegDoesNotDependOnLdLibraryPath() throws Exception {
+        ExecResult result = execFfmpegVersion();
+
+        assertEquals(result.stderr, 0, result.exitCode);
+        assertTrue(result.stdout, result.stdout.startsWith("ffmpeg version"));
+        assertFalse(result.environment.containsKey("LD_LIBRARY_PATH"));
     }
 
     @Test
@@ -137,6 +158,34 @@ public final class TranscoderServiceInstrumentedTest {
         }
         String command = "pm grant " + context.getPackageName() + " " + Manifest.permission.POST_NOTIFICATIONS;
         try (ParcelFileDescriptor ignored = InstrumentationRegistry.getInstrumentation().getUiAutomation().executeShellCommand(command)) {
+        }
+    }
+
+    private ExecResult execFfmpegVersion() throws Exception {
+        ProcessBuilder builder = new ProcessBuilder(AppConfig.ffmpegPath(context), "-version");
+        builder.environment().remove("LD_LIBRARY_PATH");
+        Process process = builder.start();
+        String stdout;
+        String stderr;
+        try (InputStream out = process.getInputStream(); InputStream err = process.getErrorStream()) {
+            stdout = readAll(out);
+            stderr = readAll(err);
+        }
+        int exit = process.waitFor();
+        return new ExecResult(exit, stdout, stderr, new HashMap<>(builder.environment()));
+    }
+
+    private static final class ExecResult {
+        final int exitCode;
+        final String stdout;
+        final String stderr;
+        final Map<String, String> environment;
+
+        ExecResult(int exitCode, String stdout, String stderr, Map<String, String> environment) {
+            this.exitCode = exitCode;
+            this.stdout = stdout;
+            this.stderr = stderr;
+            this.environment = environment;
         }
     }
 

@@ -18,6 +18,18 @@ android {
         }
     }
 
+    testBuildType "vanilla"
+
+    buildTypes {
+        vanilla {
+            initWith release
+            matchingFallbacks = ["release"]
+            debuggable false
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
     bundle {
         abi {
             enableSplit = true

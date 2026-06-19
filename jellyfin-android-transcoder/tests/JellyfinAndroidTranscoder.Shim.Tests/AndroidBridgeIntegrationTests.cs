@@ -24,13 +24,7 @@ public sealed class AndroidBridgeIntegrationTests : IDisposable
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
-if [[ "$*" == *"-f matroska pipe:1"* ]]; then
-  printf 'producer-matroska'
-  exit 0
-fi
-cat > "$JFAT_PACKAGER_STDIN"
-printf 'packaged-output' > "${@: -1}"
-exit 0
+exit 99
 """);
         var ffprobe = WriteExecutable("fake-ffprobe.sh", """
 #!/usr/bin/env bash
@@ -40,12 +34,11 @@ cat <<'JSON'
 JSON
 """);
         var ffmpegLog = Path.Combine(_tempDir, "ffmpeg.log");
-        var packagerStdin = Path.Combine(_tempDir, "packager.stdin");
         Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
-        Environment.SetEnvironmentVariable("JFAT_PACKAGER_STDIN", packagerStdin);
+        await File.WriteAllTextAsync(ffmpegLog, "");
 
         var input = Path.Combine(_tempDir, "movie.mkv");
-        await File.WriteAllTextAsync(input, "placeholder");
+        await File.WriteAllTextAsync(input, "placeholder-matroska");
         var output = Path.Combine(_tempDir, "segment.m3u8");
 
         await using var android = await MockAndroidService.Start(["mpegts-from-android"u8.ToArray()]);
@@ -54,14 +47,16 @@ JSON
         var exitCode = await Program.Main(JellyfinArgs(input, output));
 
         Assert.Equal(0, exitCode);
-        Assert.Equal("packaged-output", await File.ReadAllTextAsync(output));
-        Assert.Equal("mpegts-from-android", await File.ReadAllTextAsync(packagerStdin));
+        Assert.Equal("", await File.ReadAllTextAsync(ffmpegLog));
+        Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
+        Assert.Contains("segment0.ts", await File.ReadAllTextAsync(output));
+        Assert.Equal("mpegts-from-android", await File.ReadAllTextAsync(Path.Combine(_tempDir, "segment0.ts")));
 
         var request = await android.GetSingleRequest();
         Assert.Equal("/api/v1/transcode", request.Path);
         Assert.Equal("Bearer test-token", request.Authorization);
         Assert.Equal("video/x-matroska", request.ContentType);
-        Assert.Equal("producer-matroska", Encoding.UTF8.GetString(request.Body));
+        Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.Body));
         Assert.Equal("h264", request.Query["codec"]);
         Assert.Equal("1920", request.Query["width"]);
         Assert.Equal("1080", request.Query["height"]);
@@ -70,12 +65,6 @@ JSON
         Assert.Equal("120", request.Query["gop"]);
         Assert.Equal("1", request.Query["toneMap"]);
 
-        var invocations = await File.ReadAllLinesAsync(ffmpegLog);
-        Assert.Contains(invocations, line => line.Contains("-f matroska pipe:1", StringComparison.Ordinal));
-        Assert.Contains(invocations, line => line.Contains("-i pipe:0", StringComparison.Ordinal) &&
-                                             line.Contains("-codec:v:0 copy", StringComparison.Ordinal) &&
-                                             line.Contains("-codec:a:0 libfdk_aac", StringComparison.Ordinal) &&
-                                             line.EndsWith(output, StringComparison.Ordinal));
     }
 
     [Fact]
@@ -113,7 +102,6 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
     {
         Environment.SetEnvironmentVariable("JFAT_CONFIG", _previousConfig);
         Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", null);
-        Environment.SetEnvironmentVariable("JFAT_PACKAGER_STDIN", null);
         Directory.Delete(_tempDir, recursive: true);
     }
 
@@ -156,7 +144,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
         "-codec:a:0", "libfdk_aac", "-ac", "2", "-ab", "256000", "-af", "volume=2",
         "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
         "-f", "hls", "-hls_time", "3", "-hls_segment_type", "fmp4",
-        "-hls_segment_filename", Path.Combine(Path.GetDirectoryName(output)!, "segment%d.mp4"),
+        "-hls_segment_filename", Path.Combine(Path.GetDirectoryName(output)!, "segment%d.ts"),
         "-y", output
     ];
 
