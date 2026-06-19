@@ -1,6 +1,4 @@
-using System.Diagnostics;
 using System.Net.Http.Headers;
-using System.Text.Json;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.MediaEncoding;
@@ -36,7 +34,7 @@ public sealed class AndroidTranscoderController : ControllerBase
     public ActionResult<PluginConfiguration> SaveConfiguration([FromBody] PluginConfiguration config)
     {
         Plugin.Instance?.SaveConfiguration(config);
-        WriteShimConfig(config);
+        ShimInstaller.WriteShimConfig(config);
         return config;
     }
 
@@ -58,7 +56,7 @@ public sealed class AndroidTranscoderController : ControllerBase
             config.MaxBitrate = pasted.MaxBitrate.Value;
         }
         plugin.SaveConfiguration(config);
-        WriteShimConfig(config);
+        ShimInstaller.WriteShimConfig(config);
         return config;
     }
 
@@ -81,17 +79,7 @@ public sealed class AndroidTranscoderController : ControllerBase
     public ActionResult<object> InstallShim()
     {
         var config = CurrentConfig();
-        var plugin = Plugin.Instance ?? throw new InvalidOperationException("Plugin is not initialized");
-        var source = Path.Combine(Path.GetDirectoryName(plugin.AssemblyFilePath) ?? plugin.DataFolderPath, "shim-payload", "jfat-ffmpeg");
-        if (!System.IO.File.Exists(source))
-        {
-            return BadRequest(new { ok = false, error = $"Shim payload not found at {source}. Publish JellyfinAndroidTranscoder.Shim and copy jfat-ffmpeg into shim-payload." });
-        }
-
-        Directory.CreateDirectory(Path.GetDirectoryName(config.ShimPath)!);
-        System.IO.File.Copy(source, config.ShimPath, overwrite: true);
-        MakeExecutable(config.ShimPath);
-        WriteShimConfig(config);
+        ShimInstaller.Install(config);
         return new { ok = true, config.ShimPath };
     }
 
@@ -131,32 +119,4 @@ public sealed class AndroidTranscoderController : ControllerBase
         return Plugin.Instance?.Configuration ?? throw new InvalidOperationException("Plugin is not initialized");
     }
 
-    private static void WriteShimConfig(PluginConfiguration config)
-    {
-        var shimConfig = new ShimConfigFile(
-            config.Enabled,
-            config.AndroidBaseUrl,
-            config.Token,
-            config.RealFfmpegPath,
-            config.RealFfprobePath,
-            config.MaxBitrate);
-        var path = Path.Combine(Path.GetDirectoryName(config.ShimPath)!, "shim-config.json");
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        System.IO.File.WriteAllText(path, JsonSerializer.Serialize(shimConfig, new JsonSerializerOptions { WriteIndented = true }));
-    }
-
-    private static void MakeExecutable(string path)
-    {
-        if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
-        {
-            System.IO.File.SetUnixFileMode(path,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-                UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
-                UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
-            return;
-        }
-
-        using var process = Process.Start("chmod", ["755", path]);
-        process?.WaitForExit();
-    }
 }
