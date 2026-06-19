@@ -36,6 +36,7 @@ public class TranscoderService extends Service {
     private static final String CHANNEL = "transcoder";
     private static final String TAG = "AndroidTranscoder";
     private static final AtomicInteger ACTIVE_JOBS = new AtomicInteger();
+    private static final AtomicInteger ACCEPTED_JOBS = new AtomicInteger();
     private static final AtomicInteger COMPLETED_JOBS = new AtomicInteger();
     private static volatile boolean running;
 
@@ -145,6 +146,7 @@ public class TranscoderService extends Service {
         obj.put("name", "HiddenSwitch Android Transcoder");
         obj.put("version", "0.1.0");
         obj.put("activeJobs", ACTIVE_JOBS.get());
+        obj.put("acceptedJobs", ACCEPTED_JOBS.get());
         obj.put("completedJobs", COMPLETED_JOBS.get());
         obj.put("maxJobs", 1);
         obj.put("ffmpegPath", AppConfig.ffmpegPath(this));
@@ -164,6 +166,7 @@ public class TranscoderService extends Service {
         }
         Process process = null;
         try {
+            ACCEPTED_JOBS.incrementAndGet();
             List<String> command = ffmpegCommand(request.query);
             process = new ProcessBuilder(command).redirectErrorStream(false).start();
             Process ffmpeg = process;
