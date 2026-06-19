@@ -49,7 +49,10 @@ public sealed record ShimConfig(
     public static ShimConfig Load()
     {
         var path = Environment.GetEnvironmentVariable("JFAT_CONFIG")
-                   ?? "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim-config.json";
+                   ?? FirstExisting(
+                       Path.Combine(AppContext.BaseDirectory, "shim-config.json"),
+                       "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/shim-config.json",
+                       "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim-config.json");
         if (!File.Exists(path))
         {
             return new ShimConfig(false, "", "", "/usr/lib/jellyfin-ffmpeg/ffmpeg",
@@ -60,6 +63,9 @@ public sealed record ShimConfig(
             new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         return json ?? throw new InvalidOperationException($"Invalid config: {path}");
     }
+
+    private static string FirstExisting(params string[] paths) =>
+        paths.FirstOrDefault(File.Exists) ?? paths[0];
 }
 
 public sealed class FfmpegCommand
