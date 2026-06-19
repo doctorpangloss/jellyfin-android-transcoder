@@ -328,9 +328,15 @@ public class TranscoderService extends Service {
     }
 
     private static void writeExitPart(OutputStream out, String boundary, int exitCode) throws IOException {
-        byte[] finalPart = ("--" + boundary + "\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\n\r\n{\"exitCode\":" + exitCode + "}\r\n--" + boundary + "--\r\n")
-                .getBytes(StandardCharsets.US_ASCII);
-        writeChunk(out, finalPart);
+        byte[] body = ("{\"exitCode\":" + exitCode + "}").getBytes(StandardCharsets.US_ASCII);
+        ByteArrayOutputStream finalPart = new ByteArrayOutputStream();
+        finalPart.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.US_ASCII));
+        finalPart.write("Content-Type: application/json\r\n".getBytes(StandardCharsets.US_ASCII));
+        finalPart.write("X-Remote-Event: exit\r\n".getBytes(StandardCharsets.US_ASCII));
+        finalPart.write(("Content-Length: " + body.length + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        finalPart.write(body);
+        finalPart.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.US_ASCII));
+        writeChunk(out, finalPart.toByteArray());
         out.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
         out.flush();
     }
