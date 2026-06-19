@@ -182,14 +182,15 @@ public class TranscoderService extends Service {
             List<String> command = remoteProcessCommand(request, outputDir);
             process = new ProcessBuilder(command).redirectErrorStream(false).start();
             Process child = process;
+            StringBuffer stderrText = new StringBuffer();
             Thread stdin = new Thread(() -> pipeRequestBody(request, requestBody, child), "remoteprocess-stdin");
             Thread stdout = new Thread(() -> drainStream(child.getInputStream()), "remoteprocess-stdout");
-            Thread stderr = new Thread(() -> logStream(child.getErrorStream()), "remoteprocess-stderr");
+            Thread stderr = new Thread(() -> logStream(child.getErrorStream(), stderrText), "remoteprocess-stderr");
             stdin.start();
             stdout.start();
             stderr.start();
 
-            int exit = streamMultipartFiles(response, outputDir, child);
+            int exit = streamMultipartFiles(response, outputDir, child, stderrText);
             stdin.join();
             stdout.join();
             stderr.join();
@@ -276,7 +277,7 @@ public class TranscoderService extends Service {
         out.flush();
     }
 
-    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process) throws IOException, InterruptedException {
+    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process, StringBuffer stderrText) throws IOException, InterruptedException {
         String boundary = "jfat-" + UUID.randomUUID();
         writeHeaders(out, 200, "multipart/mixed; boundary=" + boundary, true);
         Map<String, FileSnapshot> observed = new HashMap<>();
@@ -294,7 +295,7 @@ public class TranscoderService extends Service {
             streamStableFiles(out, outputDir, boundary, observed, sent);
             Thread.sleep(100);
         }
-        writeExitPart(out, boundary, exitCode);
+        writeExitPart(out, boundary, exitCode, stderrText.toString());
         return exitCode;
     }
 
@@ -327,8 +328,14 @@ public class TranscoderService extends Service {
         writeChunk(out, part.toByteArray());
     }
 
-    private static void writeExitPart(OutputStream out, String boundary, int exitCode) throws IOException {
-        byte[] body = ("{\"exitCode\":" + exitCode + "}").getBytes(StandardCharsets.US_ASCII);
+    private static void writeExitPart(OutputStream out, String boundary, int exitCode, String stderr) throws IOException {
+        JSONObject json = new JSONObject();
+        try {
+            json.put("exitCode", exitCode);
+            json.put("stderr", stderr);
+        } catch (Exception ignored) {
+        }
+        byte[] body = json.toString().getBytes(StandardCharsets.UTF_8);
         ByteArrayOutputStream finalPart = new ByteArrayOutputStream();
         finalPart.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.US_ASCII));
         finalPart.write("Content-Type: application/json\r\n".getBytes(StandardCharsets.US_ASCII));
@@ -454,20 +461,24 @@ public class TranscoderService extends Service {
         }
     }
 
-    private static void logStream(InputStream in) {
+    private static void logStream(InputStream in, StringBuffer stderrText) {
         try {
             ByteArrayOutputStream line = new ByteArrayOutputStream();
             int c;
             while ((c = in.read()) >= 0) {
                 if (c == '\n') {
-                    Log.w(TAG, line.toString(StandardCharsets.UTF_8.name()));
+                    String text = line.toString(StandardCharsets.UTF_8.name());
+                    stderrText.append(text).append('\n');
+                    Log.w(TAG, text);
                     line.reset();
                 } else {
                     line.write(c);
                 }
             }
             if (line.size() > 0) {
-                Log.w(TAG, line.toString(StandardCharsets.UTF_8.name()));
+                String text = line.toString(StandardCharsets.UTF_8.name());
+                stderrText.append(text).append('\n');
+                Log.w(TAG, text);
             }
         } catch (IOException ex) {
             Log.w(TAG, "Failed reading ffmpeg stderr", ex);

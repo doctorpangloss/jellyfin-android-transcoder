@@ -383,6 +383,13 @@ public static class MultipartUtil
             {
                 using var document = JsonDocument.Parse(body);
                 exitCode = document.RootElement.GetProperty("exitCode").GetInt32();
+                if (exitCode != 0 &&
+                    document.RootElement.TryGetProperty("stderr", out var stderr) &&
+                    stderr.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(stderr.GetString()))
+                {
+                    Console.Error.WriteLine(stderr.GetString());
+                }
                 continue;
             }
 
