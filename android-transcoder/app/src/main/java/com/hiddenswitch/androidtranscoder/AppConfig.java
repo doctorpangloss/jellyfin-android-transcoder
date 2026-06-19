@@ -35,6 +35,16 @@ final class AppConfig {
         return token;
     }
 
+    static void setToken(Context context, String token) {
+        if (token == null || token.isEmpty()) {
+            return;
+        }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(TOKEN, token)
+                .apply();
+    }
+
     static String ffmpegPath(Context context) {
         return context.getApplicationInfo().nativeLibraryDir + "/libffmpeg.so";
     }

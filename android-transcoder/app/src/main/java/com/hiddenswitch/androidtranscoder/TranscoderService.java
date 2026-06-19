@@ -7,6 +7,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
+import android.util.Log;
 
 import org.json.JSONObject;
 
@@ -28,11 +29,14 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class TranscoderService extends Service {
     private static final String CHANNEL = "transcoder";
+    private static final String TAG = "AndroidTranscoder";
     private static final AtomicInteger ACTIVE_JOBS = new AtomicInteger();
+    private static final AtomicInteger COMPLETED_JOBS = new AtomicInteger();
     private static volatile boolean running;
 
     private ExecutorService executor;
@@ -46,6 +50,7 @@ public class TranscoderService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        Log.i(TAG, "TranscoderService onCreate");
         createChannel();
         startForeground(1, notification("Listening on :" + AppConfig.PORT));
         executor = Executors.newCachedThreadPool();
@@ -55,6 +60,10 @@ public class TranscoderService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        Log.i(TAG, "TranscoderService onStartCommand");
+        if (intent != null && intent.hasExtra("token")) {
+            AppConfig.setToken(this, intent.getStringExtra("token"));
+        }
         return START_STICKY;
     }
 
@@ -82,11 +91,13 @@ public class TranscoderService extends Service {
         acceptThread = new Thread(() -> {
             try {
                 server = new ServerSocket(AppConfig.PORT);
+                Log.i(TAG, "Listening on " + AppConfig.PORT);
                 while (!Thread.currentThread().isInterrupted()) {
                     Socket socket = server.accept();
                     executor.submit(() -> handle(socket));
                 }
-            } catch (IOException ignored) {
+            } catch (IOException ex) {
+                Log.e(TAG, "Server failed", ex);
             }
         }, "android-transcoder-http");
         acceptThread.start();
@@ -114,7 +125,8 @@ public class TranscoderService extends Service {
                 return;
             }
             writeText(out, 404, "not found\n");
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            Log.e(TAG, "Request failed", ex);
         } finally {
             try {
                 socket.close();
@@ -133,6 +145,7 @@ public class TranscoderService extends Service {
         obj.put("name", "HiddenSwitch Android Transcoder");
         obj.put("version", "0.1.0");
         obj.put("activeJobs", ACTIVE_JOBS.get());
+        obj.put("completedJobs", COMPLETED_JOBS.get());
         obj.put("maxJobs", 1);
         obj.put("ffmpegPath", AppConfig.ffmpegPath(this));
         obj.put("tokenRequired", true);
@@ -155,7 +168,7 @@ public class TranscoderService extends Service {
             process = new ProcessBuilder(command).redirectErrorStream(false).start();
             Process ffmpeg = process;
             Thread stdin = new Thread(() -> pipeRequestBody(request, requestBody, ffmpeg), "ffmpeg-stdin");
-            Thread stderr = new Thread(() -> drain(ffmpeg.getErrorStream()), "ffmpeg-stderr");
+            Thread stderr = new Thread(() -> logStream(ffmpeg.getErrorStream()), "ffmpeg-stderr");
             stdin.start();
             stderr.start();
 
@@ -163,10 +176,15 @@ public class TranscoderService extends Service {
             pipeChunked(ffmpeg.getInputStream(), response);
             stdin.join();
             stderr.join();
-            int exit = ffmpeg.waitFor();
+            if (!ffmpeg.waitFor(120, TimeUnit.SECONDS)) {
+                ffmpeg.destroyForcibly();
+                throw new IOException("ffmpeg timed out");
+            }
+            int exit = ffmpeg.exitValue();
             if (exit != 0) {
                 throw new IOException("ffmpeg exited " + exit);
             }
+            COMPLETED_JOBS.incrementAndGet();
         } finally {
             if (process != null) {
                 process.destroyForcibly();
@@ -323,12 +341,23 @@ public class TranscoderService extends Service {
         }
     }
 
-    private static void drain(InputStream in) {
+    private static void logStream(InputStream in) {
         try {
-            byte[] buffer = new byte[8192];
-            while (in.read(buffer) >= 0) {
+            ByteArrayOutputStream line = new ByteArrayOutputStream();
+            int c;
+            while ((c = in.read()) >= 0) {
+                if (c == '\n') {
+                    Log.w(TAG, line.toString(StandardCharsets.UTF_8.name()));
+                    line.reset();
+                } else {
+                    line.write(c);
+                }
             }
-        } catch (IOException ignored) {
+            if (line.size() > 0) {
+                Log.w(TAG, line.toString(StandardCharsets.UTF_8.name()));
+            }
+        } catch (IOException ex) {
+            Log.w(TAG, "Failed reading ffmpeg stderr", ex);
         }
     }
 

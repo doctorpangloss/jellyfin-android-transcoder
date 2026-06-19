@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -21,6 +22,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 
 public class MainActivity extends Activity {
+    private static final String TAG = "AndroidTranscoder";
     private TextView info;
     private TextView json;
 
@@ -85,6 +87,14 @@ public class MainActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         scroll.addView(root);
         setContentView(scroll);
+        applyAutomationIntent(getIntent());
+        refresh();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        applyAutomationIntent(intent);
         refresh();
     }
 
@@ -106,6 +116,25 @@ public class MainActivity extends Activity {
         }
         info.setText(builder.toString());
         json.setText(AppConfig.connectionJson(this));
+    }
+
+    private void applyAutomationIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        if (intent.hasExtra("token")) {
+            Log.i(TAG, "Applying automation token");
+            AppConfig.setToken(this, intent.getStringExtra("token"));
+        }
+        if (intent.getBooleanExtra("startService", false)) {
+            Log.i(TAG, "Starting service from activity automation intent");
+            Intent service = new Intent(this, TranscoderService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(service);
+            } else {
+                startService(service);
+            }
+        }
     }
 
     private String ffmpegVersion() {
