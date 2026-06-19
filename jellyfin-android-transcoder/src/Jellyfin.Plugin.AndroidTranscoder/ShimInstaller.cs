@@ -5,9 +5,9 @@ namespace Jellyfin.Plugin.AndroidTranscoder;
 
 internal static class ShimInstaller
 {
-    public static void Install(PluginConfiguration config)
+    public static void Install(PluginConfiguration config, string? source = null)
     {
-        var source = GetShimPayloadPath();
+        source ??= GetShimPayloadPath();
         if (!File.Exists(source))
         {
             throw new FileNotFoundException($"Shim payload not found at {source}. Publish JellyfinAndroidTranscoder.Shim and copy jfat-ffmpeg into shim-payload.", source);
