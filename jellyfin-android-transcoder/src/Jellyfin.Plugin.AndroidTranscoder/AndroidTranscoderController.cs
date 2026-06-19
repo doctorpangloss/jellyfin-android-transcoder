@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
+using MediaBrowser.Controller.MediaEncoding;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Jellyfin.Plugin.AndroidTranscoder;
@@ -12,13 +13,16 @@ namespace Jellyfin.Plugin.AndroidTranscoder;
 public sealed class AndroidTranscoderController : ControllerBase
 {
     private readonly IServerConfigurationManager _configurationManager;
+    private readonly IMediaEncoder _mediaEncoder;
     private readonly IHttpClientFactory _httpClientFactory;
 
     public AndroidTranscoderController(
         IServerConfigurationManager configurationManager,
+        IMediaEncoder mediaEncoder,
         IHttpClientFactory httpClientFactory)
     {
         _configurationManager = configurationManager;
+        _mediaEncoder = mediaEncoder;
         _httpClientFactory = httpClientFactory;
     }
 
@@ -95,22 +99,31 @@ public sealed class AndroidTranscoderController : ControllerBase
     public ActionResult<object> ApplyFfmpegPath()
     {
         var config = CurrentConfig();
-        var options = _configurationManager.GetEncodingOptions();
-        options.EncoderAppPath = config.ShimPath;
-        options.EncoderAppPathDisplay = config.ShimPath;
-        _configurationManager.SaveConfiguration("encoding", options);
-        return new { ok = true, ffmpeg = config.ShimPath };
+        return SetFfmpegPath(config.ShimPath);
     }
 
     [HttpPost("RestoreFfmpegPath")]
     public ActionResult<object> RestoreFfmpegPath()
     {
         var config = CurrentConfig();
+        return SetFfmpegPath(config.RealFfmpegPath);
+    }
+
+    private ActionResult<object> SetFfmpegPath(string path)
+    {
         var options = _configurationManager.GetEncodingOptions();
-        options.EncoderAppPath = config.RealFfmpegPath;
-        options.EncoderAppPathDisplay = config.RealFfmpegPath;
+        options.EncoderAppPath = path;
+        options.EncoderAppPathDisplay = path;
         _configurationManager.SaveConfiguration("encoding", options);
-        return new { ok = true, ffmpeg = config.RealFfmpegPath };
+
+        var active = _mediaEncoder.SetFFmpegPath();
+        return new
+        {
+            ok = active,
+            ffmpeg = path,
+            activeFfmpeg = _mediaEncoder.EncoderPath,
+            restartRequired = !active || !string.Equals(_mediaEncoder.EncoderPath, path, StringComparison.Ordinal)
+        };
     }
 
     private PluginConfiguration CurrentConfig()
