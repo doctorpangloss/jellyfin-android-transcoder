@@ -211,6 +211,8 @@ public sealed class FfmpegCommand
 public sealed record MediaProbe(
     string CodecName,
     string PixelFormat,
+    int Width,
+    int Height,
     string? ColorSpace,
     string? ColorTransfer,
     string? ColorPrimaries)
@@ -227,7 +229,7 @@ public sealed record MediaProbe(
         {
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name,pix_fmt,color_space,color_transfer,color_primaries",
+            "-show_entries", "stream=codec_name,pix_fmt,width,height,color_space,color_transfer,color_primaries",
             "-of", "json",
             inputPath
         };
@@ -237,6 +239,8 @@ public sealed record MediaProbe(
         return new MediaProbe(
             GetString(stream, "codec_name") ?? "",
             GetString(stream, "pix_fmt") ?? "",
+            GetInt(stream, "width"),
+            GetInt(stream, "height"),
             GetString(stream, "color_space"),
             GetString(stream, "color_transfer"),
             GetString(stream, "color_primaries"));
@@ -248,6 +252,11 @@ public sealed record MediaProbe(
             ? value.GetString()
             : null;
     }
+
+    private static int GetInt(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.TryGetInt32(out var result)
+            ? result
+            : 0;
 }
 
 public sealed record RouteDecision(bool Route, string Reason)
@@ -298,6 +307,7 @@ public static class AndroidTranscode
     {
         var toneMap = probe.IsHdr ? 1 : 0;
         var bitrate = Math.Min(command.MaxRate, config.MaxBitrate);
+        var (outputWidth, outputHeight) = OutputDimensions(command, probe);
         var outputName = Path.GetFileName(command.OutputPath!);
         var segmentName = Path.GetFileName(command.HlsSegmentFilename ?? Path.ChangeExtension(command.OutputPath!, ".ts"));
         return
@@ -312,8 +322,8 @@ public static class AndroidTranscode
             "-map", "0:v:0",
             "-c:v", "h264_mediacodec",
             "-pix_fmt", "mediacodec",
-            "-output_width", command.Width.ToString(),
-            "-output_height", command.Height.ToString(),
+            "-output_width", outputWidth.ToString(),
+            "-output_height", outputHeight.ToString(),
             "-surface_tonemap", toneMap.ToString(),
             "-b:v", bitrate.ToString(),
             "-maxrate", bitrate.ToString(),
@@ -330,6 +340,21 @@ public static class AndroidTranscode
             "-y", "{outputRoot}/" + outputName
         ];
     }
+
+    private static (int Width, int Height) OutputDimensions(FfmpegCommand command, MediaProbe probe)
+    {
+        if (probe.Width <= 0 || probe.Height <= 0)
+        {
+            return (command.Width, command.Height);
+        }
+        if (command.Width <= probe.Width && command.Height <= probe.Height)
+        {
+            return (command.Width, command.Height);
+        }
+        return (Even(probe.Width), Even(probe.Height));
+    }
+
+    private static int Even(int value) => Math.Max(2, value / 2 * 2);
 
     private static string EncodeRemoteArgs(IReadOnlyList<string> args)
     {
