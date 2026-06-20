@@ -68,6 +68,8 @@ JSON
         Assert.Contains("{outputRoot}/segment.m3u8", request.RemoteArgs);
         Assert.Contains("\"-output_width\",\"320\"", request.RemoteArgs);
         Assert.Contains("\"-output_height\",\"180\"", request.RemoteArgs);
+        Assert.Contains("\"-g\",\"24\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_time\",\"1\"", request.RemoteArgs);
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
 

@@ -308,6 +308,7 @@ public static class AndroidTranscode
         var toneMap = probe.IsHdr ? 1 : 0;
         var bitrate = Math.Min(command.MaxRate, config.MaxBitrate);
         var (outputWidth, outputHeight) = OutputDimensions(command, probe);
+        const int startupSegmentSeconds = 1;
         var outputName = Path.GetFileName(command.OutputPath!);
         var segmentName = Path.GetFileName(command.HlsSegmentFilename ?? Path.ChangeExtension(command.OutputPath!, ".ts"));
         return
@@ -329,12 +330,12 @@ public static class AndroidTranscode
             "-maxrate", bitrate.ToString(),
             "-bufsize", Math.Max(command.BufSize, bitrate * 2).ToString(),
             "-bitrate_mode", "cbr",
-            "-g", (command.GopSeconds * 40).ToString(),
+            "-g", "24",
             "-an",
             "-sn",
             "-dn",
             "-f", "hls",
-            "-hls_time", Math.Max(command.GopSeconds, 1).ToString(),
+            "-hls_time", startupSegmentSeconds.ToString(),
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", "{outputRoot}/" + segmentName,
             "-y", "{outputRoot}/" + outputName
