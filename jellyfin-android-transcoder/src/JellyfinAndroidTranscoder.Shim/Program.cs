@@ -381,6 +381,11 @@ public static class AndroidTranscode
             args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
         }
         args.AddRange(["-i", "{input}"]);
+        if (probe.DurationSeconds > 0)
+        {
+            args.Add("-t");
+            args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+        }
         args.AddRange([
             "-map", "0:v:0",
             "-c:v", "h264_mediacodec",

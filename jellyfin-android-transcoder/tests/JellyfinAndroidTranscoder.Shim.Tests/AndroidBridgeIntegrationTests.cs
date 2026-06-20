@@ -70,7 +70,7 @@ JSON
         Assert.Contains("\"-output_height\",\"180\"", request.RemoteArgs);
         Assert.Contains("\"-g\",\"24\"", request.RemoteArgs);
         Assert.Contains("\"-hls_time\",\"1\"", request.RemoteArgs);
-        Assert.Contains("\"-t\",\"12.345\"", request.RemoteArgs);
+        Assert.Equal(2, CountOccurrences(request.RemoteArgs, "\"-t\",\"12.345\""));
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
 
@@ -172,6 +172,18 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
             File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
         return path;
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+        return count;
     }
 
     private void WriteConfig(string androidBaseUrl, string token, string ffmpeg, string ffprobe, int maxBitrate)
