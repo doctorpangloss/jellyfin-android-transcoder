@@ -256,19 +256,24 @@ public sealed record MediaProbe(
 
     private static string? GetString(JsonElement element, string property)
     {
-        return element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+        return element.ValueKind == JsonValueKind.Object &&
+            element.TryGetProperty(property, out var value) &&
+            value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
     }
 
     private static int GetInt(JsonElement element, string property) =>
-        element.TryGetProperty(property, out var value) && value.TryGetInt32(out var result)
+        element.ValueKind == JsonValueKind.Object &&
+        element.TryGetProperty(property, out var value) &&
+        value.TryGetInt32(out var result)
             ? result
             : 0;
 
     private static double GetDouble(JsonElement element, string property)
     {
-        if (!element.TryGetProperty(property, out var value))
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(property, out var value))
         {
             return 0;
         }
@@ -286,7 +291,8 @@ public sealed record MediaProbe(
 
     private static long GetLong(JsonElement element, string property)
     {
-        if (!element.TryGetProperty(property, out var value))
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(property, out var value))
         {
             return 0;
         }
