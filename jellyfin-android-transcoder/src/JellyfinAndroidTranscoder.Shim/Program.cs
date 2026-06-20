@@ -306,6 +306,7 @@ public sealed record RouteDecision(bool Route, string Reason)
 public static class AndroidTranscode
 {
     private const int RemoteInputBytesPerSecond = 10_000_000;
+    private const long MinimumRemoteInputBytes = 64L * 1024L * 1024L;
 
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
@@ -316,7 +317,8 @@ public static class AndroidTranscode
         request.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
         request.Headers.TryAddWithoutValidation("X-Remote-Args", EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)));
         await using var input = File.OpenRead(command.InputPath!);
-        await using var limitedInput = new RateLimitedReadStream(input, RemoteInputBytesPerSecond);
+        await using var boundedInput = new BoundedReadStream(input, RemoteInputLimit(input.Length, probe));
+        await using var limitedInput = new RateLimitedReadStream(boundedInput, RemoteInputBytesPerSecond);
         request.Content = new StreamContent(limitedInput);
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
@@ -399,6 +401,75 @@ public static class AndroidTranscode
             .TrimEnd('=')
             .Replace('+', '-')
             .Replace('/', '_');
+    }
+
+    private static long RemoteInputLimit(long fileLength, MediaProbe probe)
+    {
+        if (probe.DurationSeconds <= 0)
+        {
+            return fileLength;
+        }
+        var durationBudget = (long)Math.Ceiling(probe.DurationSeconds * RemoteInputBytesPerSecond);
+        return Math.Min(fileLength, Math.Max(MinimumRemoteInputBytes, durationBudget));
+    }
+}
+
+public sealed class BoundedReadStream : Stream
+{
+    private readonly Stream _inner;
+    private long _remaining;
+
+    public BoundedReadStream(Stream inner, long limit)
+    {
+        _inner = inner;
+        _remaining = limit;
+    }
+
+    public override bool CanRead => _inner.CanRead;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush() => _inner.Flush();
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        if (_remaining <= 0)
+        {
+            return 0;
+        }
+        var read = _inner.Read(buffer, offset, (int)Math.Min(count, _remaining));
+        _remaining -= read;
+        return read;
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (_remaining <= 0)
+        {
+            return 0;
+        }
+        var read = await _inner.ReadAsync(buffer[..(int)Math.Min(buffer.Length, _remaining)], cancellationToken);
+        _remaining -= read;
+        return read;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _inner.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }
 
