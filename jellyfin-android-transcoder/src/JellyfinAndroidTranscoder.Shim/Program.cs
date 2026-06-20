@@ -345,14 +345,14 @@ public static class AndroidTranscode
             "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
             "-hwaccel", "mediacodec",
             "-hwaccel_device", "mc",
-            "-hwaccel_output_format", "mediacodec",
-            "-i", "{input}"
+            "-hwaccel_output_format", "mediacodec"
         };
         if (probe.DurationSeconds > 0)
         {
             args.Add("-t");
             args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
         }
+        args.AddRange(["-i", "{input}"]);
         args.AddRange([
             "-map", "0:v:0",
             "-c:v", "h264_mediacodec",
