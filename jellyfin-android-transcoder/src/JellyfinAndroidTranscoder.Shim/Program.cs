@@ -406,6 +406,8 @@ public static class AndroidTranscode
             "-hls_flags", "temp_file",
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", "{outputRoot}/" + segmentName,
+            "-hls_playlist_type", "vod",
+            "-hls_list_size", "0",
             "-y", "{outputRoot}/" + outputName
         ]);
         return args;
