@@ -5,8 +5,10 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.util.Log;
 
 import org.json.JSONObject;
@@ -41,6 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class TranscoderService extends Service {
+    public static final String ACTION_REFRESH_POWER = "com.hiddenswitch.androidtranscoder.REFRESH_POWER";
     private static final String CHANNEL = "transcoder";
     private static final String TAG = "AndroidTranscoder";
     private static final AtomicInteger ACTIVE_JOBS = new AtomicInteger();
@@ -52,6 +55,8 @@ public class TranscoderService extends Service {
     private ExecutorService executor;
     private ServerSocket server;
     private Thread acceptThread;
+    private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
 
     static boolean isRunning() {
         return running;
@@ -64,6 +69,7 @@ public class TranscoderService extends Service {
         createChannel();
         startForeground(1, notification("Listening on :" + AppConfig.PORT));
         executor = Executors.newCachedThreadPool();
+        updatePowerLocks();
         startServer();
         running = true;
     }
@@ -74,6 +80,7 @@ public class TranscoderService extends Service {
         if (intent != null && intent.hasExtra("token")) {
             AppConfig.setToken(this, intent.getStringExtra("token"));
         }
+        updatePowerLocks();
         return START_STICKY;
     }
 
@@ -89,6 +96,7 @@ public class TranscoderService extends Service {
         if (executor != null) {
             executor.shutdownNow();
         }
+        releasePowerLocks();
         super.onDestroy();
     }
 
@@ -111,6 +119,43 @@ public class TranscoderService extends Service {
             }
         }, "android-transcoder-http");
         acceptThread.start();
+    }
+
+    private void updatePowerLocks() {
+        if (AppConfig.keepAwake(this)) {
+            acquirePowerLocks();
+        } else {
+            releasePowerLocks();
+        }
+    }
+
+    private void acquirePowerLocks() {
+        if (wakeLock == null) {
+            PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AndroidTranscoder:Service");
+            wakeLock.setReferenceCounted(false);
+        }
+        if (!wakeLock.isHeld()) {
+            wakeLock.acquire();
+        }
+
+        if (wifiLock == null) {
+            WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AndroidTranscoder:Wifi");
+            wifiLock.setReferenceCounted(false);
+        }
+        if (!wifiLock.isHeld()) {
+            wifiLock.acquire();
+        }
+    }
+
+    private void releasePowerLocks() {
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+        }
+        if (wifiLock != null && wifiLock.isHeld()) {
+            wifiLock.release();
+        }
     }
 
     private void handle(Socket socket) {
@@ -161,6 +206,8 @@ public class TranscoderService extends Service {
         obj.put("maxJobs", 1);
         obj.put("ffmpegPath", AppConfig.ffmpegPath(this));
         obj.put("tokenRequired", true);
+        obj.put("startOnBoot", AppConfig.startOnBoot(this));
+        obj.put("keepAwake", AppConfig.keepAwake(this));
         obj.put("capabilities", new JSONObject()
                 .put("api", "remoteprocesses")
                 .put("output", "multipart/mixed")

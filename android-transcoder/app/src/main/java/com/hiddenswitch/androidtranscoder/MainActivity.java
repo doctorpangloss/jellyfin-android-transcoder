@@ -12,9 +12,11 @@ import android.os.Bundle;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -25,6 +27,8 @@ public class MainActivity extends Activity {
     private static final String TAG = "AndroidTranscoder";
     private TextView info;
     private TextView json;
+    private Switch startOnBoot;
+    private Switch keepAwake;
 
     @Override
     protected void onCreate(Bundle bundle) {
@@ -65,6 +69,34 @@ public class MainActivity extends Activity {
         });
         root.addView(stop);
 
+        startOnBoot = new Switch(this);
+        startOnBoot.setText("Start on boot");
+        startOnBoot.setChecked(AppConfig.startOnBoot(this));
+        startOnBoot.setOnCheckedChangeListener((button, checked) -> {
+            AppConfig.setStartOnBoot(this, checked);
+            refresh();
+        });
+        root.addView(startOnBoot);
+
+        keepAwake = new Switch(this);
+        keepAwake.setText("Keep screen and Wi-Fi awake");
+        keepAwake.setChecked(AppConfig.keepAwake(this));
+        keepAwake.setOnCheckedChangeListener((button, checked) -> {
+            AppConfig.setKeepAwake(this, checked);
+            applyKeepAwakeWindowFlag();
+            Intent service = new Intent(this, TranscoderService.class);
+            service.setAction(TranscoderService.ACTION_REFRESH_POWER);
+            if (TranscoderService.isRunning()) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    startForegroundService(service);
+                } else {
+                    startService(service);
+                }
+            }
+            refresh();
+        });
+        root.addView(keepAwake);
+
         Button copy = new Button(this);
         copy.setText("Copy Plugin JSON");
         copy.setOnClickListener(v -> {
@@ -88,6 +120,7 @@ public class MainActivity extends Activity {
         scroll.addView(root);
         setContentView(scroll);
         applyAutomationIntent(getIntent());
+        applyKeepAwakeWindowFlag();
         refresh();
     }
 
@@ -105,10 +138,14 @@ public class MainActivity extends Activity {
     }
 
     private void refresh() {
+        startOnBoot.setChecked(AppConfig.startOnBoot(this));
+        keepAwake.setChecked(AppConfig.keepAwake(this));
         StringBuilder builder = new StringBuilder();
         builder.append("Service: ").append(TranscoderService.isRunning() ? "running" : "stopped").append("\n");
         builder.append("Port: ").append(AppConfig.PORT).append("\n");
         builder.append("Token: ").append(AppConfig.token(this)).append("\n");
+        builder.append("Start on boot: ").append(AppConfig.startOnBoot(this) ? "enabled" : "disabled").append("\n");
+        builder.append("Keep awake: ").append(AppConfig.keepAwake(this) ? "enabled" : "disabled").append("\n");
         builder.append("FFmpeg: ").append(ffmpegVersion()).append("\n");
         builder.append("URLs:\n");
         for (String url : AppConfig.baseUrls()) {
@@ -126,6 +163,13 @@ public class MainActivity extends Activity {
             Log.i(TAG, "Applying automation token");
             AppConfig.setToken(this, intent.getStringExtra("token"));
         }
+        if (intent.hasExtra("startOnBoot")) {
+            AppConfig.setStartOnBoot(this, intent.getBooleanExtra("startOnBoot", false));
+        }
+        if (intent.hasExtra("keepAwake")) {
+            AppConfig.setKeepAwake(this, intent.getBooleanExtra("keepAwake", false));
+            applyKeepAwakeWindowFlag();
+        }
         if (intent.getBooleanExtra("startService", false)) {
             Log.i(TAG, "Starting service from activity automation intent");
             Intent service = new Intent(this, TranscoderService.class);
@@ -134,6 +178,14 @@ public class MainActivity extends Activity {
             } else {
                 startService(service);
             }
+        }
+    }
+
+    private void applyKeepAwakeWindowFlag() {
+        if (AppConfig.keepAwake(this)) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         }
     }
 

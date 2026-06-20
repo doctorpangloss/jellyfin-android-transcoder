@@ -65,6 +65,45 @@ public final class TranscoderServiceInstrumentedTest {
     }
 
     @Test
+    public void testPowerTogglesPersistAndAppearInConnectionMetadata() throws Exception {
+        AppConfig.setStartOnBoot(context, true);
+        AppConfig.setKeepAwake(context, true);
+
+        assertTrue(AppConfig.startOnBoot(context));
+        assertTrue(AppConfig.keepAwake(context));
+        assertTrue(AppConfig.connectionJson(context).contains("\"startOnBoot\": true"));
+        assertTrue(AppConfig.connectionJson(context).contains("\"keepAwake\": true"));
+
+        Intent intent = new Intent(context, TranscoderService.class);
+        intent.setAction(TranscoderService.ACTION_REFRESH_POWER);
+        if (Build.VERSION.SDK_INT >= 26) {
+            context.startForegroundService(intent);
+        } else {
+            context.startService(intent);
+        }
+
+        HttpResult result = request("GET", "/api/v1/status", null, null);
+        assertTrue(result.body.contains("\"startOnBoot\":true"));
+        assertTrue(result.body.contains("\"keepAwake\":true"));
+    }
+
+    @Test
+    public void testBootReceiverStartsServiceOnlyWhenEnabled() throws Exception {
+        context.stopService(new Intent(context, TranscoderService.class));
+        waitForStopped();
+
+        AppConfig.setStartOnBoot(context, false);
+        new BootReceiver().onReceive(context, new Intent(Intent.ACTION_BOOT_COMPLETED));
+        Thread.sleep(500);
+        assertFalse(TranscoderService.isRunning());
+
+        AppConfig.setStartOnBoot(context, true);
+        new BootReceiver().onReceive(context, new Intent(Intent.ACTION_BOOT_COMPLETED));
+        waitForStatus();
+        assertTrue(TranscoderService.isRunning());
+    }
+
+    @Test
     public void testBundledFfmpegExecutesFromNormalAppContext() throws Exception {
         ExecResult result = execFfmpegVersion();
 
@@ -141,6 +180,17 @@ public final class TranscoderServiceInstrumentedTest {
             Thread.sleep(100);
         }
         throw new AssertionError("Timed out waiting for Android transcoder service", last);
+    }
+
+    private void waitForStopped() throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            if (!TranscoderService.isRunning()) {
+                return;
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("Timed out waiting for Android transcoder service to stop");
     }
 
     private static HttpResult request(String method, String path, String authorization, Map<String, String> headers, byte[] body) throws Exception {

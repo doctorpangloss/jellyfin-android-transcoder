@@ -18,6 +18,8 @@ final class AppConfig {
     static final int PORT = 8098;
     private static final String PREFS = "android-transcoder";
     private static final String TOKEN = "token";
+    private static final String START_ON_BOOT = "startOnBoot";
+    private static final String KEEP_AWAKE = "keepAwake";
 
     private AppConfig() {
     }
@@ -42,6 +44,30 @@ final class AppConfig {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit()
                 .putString(TOKEN, token)
+                .apply();
+    }
+
+    static boolean startOnBoot(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(START_ON_BOOT, false);
+    }
+
+    static void setStartOnBoot(Context context, boolean enabled) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(START_ON_BOOT, enabled)
+                .apply();
+    }
+
+    static boolean keepAwake(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEEP_AWAKE, false);
+    }
+
+    static void setKeepAwake(Context context, boolean enabled) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEEP_AWAKE, enabled)
                 .apply();
     }
 
@@ -84,6 +110,8 @@ final class AppConfig {
             obj.put("targetCodec", "h264");
             obj.put("targetWidth", 1920);
             obj.put("targetHeight", 1080);
+            obj.put("startOnBoot", startOnBoot(context));
+            obj.put("keepAwake", keepAwake(context));
             return obj.toString(2);
         } catch (Exception ex) {
             return "{}";
