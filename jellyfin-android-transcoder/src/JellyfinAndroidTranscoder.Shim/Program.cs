@@ -403,14 +403,37 @@ public static class AndroidTranscode
             "-dn",
             "-f", "hls",
             "-hls_time", startupSegmentSeconds.ToString(),
-            "-hls_flags", "temp_file",
+            "-hls_flags", HlsFlagsWithTempFile(command),
             "-hls_segment_type", "mpegts",
-            "-hls_segment_filename", "{outputRoot}/" + segmentName,
-            "-hls_playlist_type", "vod",
-            "-hls_list_size", "0",
-            "-y", "{outputRoot}/" + outputName
+            "-hls_segment_filename", "{outputRoot}/" + segmentName
         ]);
+        AddPreservedOption(args, command, "-start_number");
+        AddPreservedOption(args, command, "-hls_playlist_type");
+        AddPreservedOption(args, command, "-hls_list_size");
+        args.AddRange(["-y", "{outputRoot}/" + outputName]);
         return args;
+    }
+
+    private static string HlsFlagsWithTempFile(FfmpegCommand command)
+    {
+        var flags = (command.ValueAfter("-hls_flags") ?? "")
+            .Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToList();
+        if (!flags.Any(flag => string.Equals(flag, "temp_file", StringComparison.Ordinal)))
+        {
+            flags.Add("temp_file");
+        }
+        return string.Join("+", flags);
+    }
+
+    private static void AddPreservedOption(List<string> args, FfmpegCommand command, string option)
+    {
+        var value = command.ValueAfter(option);
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            args.Add(option);
+            args.Add(value);
+        }
     }
 
     private static (int Width, int Height) OutputDimensions(FfmpegCommand command, MediaProbe probe)

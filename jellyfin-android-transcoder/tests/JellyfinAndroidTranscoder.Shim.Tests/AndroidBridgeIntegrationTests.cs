@@ -73,6 +73,7 @@ JSON
         Assert.Contains("\"-hls_flags\",\"temp_file\"", request.RemoteArgs);
         Assert.Contains("\"-hls_playlist_type\",\"vod\"", request.RemoteArgs);
         Assert.Contains("\"-hls_list_size\",\"0\"", request.RemoteArgs);
+        Assert.Contains("\"-start_number\",\"0\"", request.RemoteArgs);
         Assert.Equal(2, CountOccurrences(request.RemoteArgs, "\"-t\",\"12.345\""));
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
@@ -217,6 +218,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
         "-codec:a:0", "libfdk_aac", "-ac", "2", "-ab", "256000", "-af", "volume=2",
         "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
         "-f", "hls", "-hls_time", "3", "-hls_segment_type", "fmp4",
+        "-start_number", "0", "-hls_playlist_type", "vod", "-hls_list_size", "0",
         "-hls_segment_filename", Path.Combine(Path.GetDirectoryName(output)!, "segment%d.ts"),
         "-y", output
     ];
