@@ -10,12 +10,15 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
@@ -104,6 +107,24 @@ public final class TranscoderServiceInstrumentedTest {
 
         assertEquals(200, result.status);
         assertTrue(result.contentType, result.contentType.startsWith("multipart/mixed"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testOutputFileListingSkipsFfmpegTempFiles() throws Exception {
+        File dir = new File(context.getCacheDir(), "hls-temp-file-test-" + System.nanoTime());
+        assertTrue(dir.mkdirs());
+        File finalSegment = new File(dir, "segment0.ts");
+        File tempSegment = new File(dir, "segment1.ts.tmp");
+        assertTrue(finalSegment.createNewFile());
+        assertTrue(tempSegment.createNewFile());
+
+        Method method = TranscoderService.class.getDeclaredMethod("listFiles", File.class);
+        method.setAccessible(true);
+        List<File> files = (List<File>) method.invoke(null, dir);
+
+        assertTrue(files.contains(finalSegment));
+        assertFalse(files.contains(tempSegment));
     }
 
     private void waitForStatus() throws Exception {

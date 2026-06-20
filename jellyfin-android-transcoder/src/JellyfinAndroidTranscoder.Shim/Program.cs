@@ -403,6 +403,7 @@ public static class AndroidTranscode
             "-dn",
             "-f", "hls",
             "-hls_time", startupSegmentSeconds.ToString(),
+            "-hls_flags", "temp_file",
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", "{outputRoot}/" + segmentName,
             "-y", "{outputRoot}/" + outputName

@@ -70,6 +70,7 @@ JSON
         Assert.Contains("\"-output_height\",\"180\"", request.RemoteArgs);
         Assert.Contains("\"-g\",\"24\"", request.RemoteArgs);
         Assert.Contains("\"-hls_time\",\"1\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_flags\",\"temp_file\"", request.RemoteArgs);
         Assert.Equal(2, CountOccurrences(request.RemoteArgs, "\"-t\",\"12.345\""));
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));

@@ -368,7 +368,7 @@ public class TranscoderService extends Service {
         for (File file : files) {
             if (file.isDirectory()) {
                 result.addAll(listFiles(file));
-            } else {
+            } else if (!file.getName().endsWith(".tmp")) {
                 result.add(file);
             }
         }
