@@ -33,7 +33,7 @@ exit 99
 #!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
-{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":320,"height":180,"color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}]}
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":320,"height":180,"color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"12.345"}}
 JSON
 """);
         var ffmpegLog = Path.Combine(_tempDir, "ffmpeg.log");
@@ -70,6 +70,7 @@ JSON
         Assert.Contains("\"-output_height\",\"180\"", request.RemoteArgs);
         Assert.Contains("\"-g\",\"24\"", request.RemoteArgs);
         Assert.Contains("\"-hls_time\",\"1\"", request.RemoteArgs);
+        Assert.Contains("\"-t\",\"12.345\"", request.RemoteArgs);
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
 
@@ -88,7 +89,7 @@ exit 99
 #!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
-{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}]}
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"7200"}}
 JSON
 """);
         var ffmpegLog = Path.Combine(_tempDir, "process-ffmpeg.log");
@@ -136,7 +137,7 @@ exit 17
         var ffprobe = WriteExecutable("fake-ffprobe.sh", """
 #!/usr/bin/env bash
 set -euo pipefail
-echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160}]}'
+echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160}],"format":{"duration":"7200"}}'
 """);
         var ffmpegLog = Path.Combine(_tempDir, "fallback-ffmpeg.log");
         Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);

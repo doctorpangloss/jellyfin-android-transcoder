@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -213,6 +214,7 @@ public sealed record MediaProbe(
     string PixelFormat,
     int Width,
     int Height,
+    double DurationSeconds,
     string? ColorSpace,
     string? ColorTransfer,
     string? ColorPrimaries)
@@ -229,18 +231,22 @@ public sealed record MediaProbe(
         {
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name,pix_fmt,width,height,color_space,color_transfer,color_primaries",
+            "-show_entries", "stream=codec_name,pix_fmt,width,height,color_space,color_transfer,color_primaries:format=duration",
             "-of", "json",
             inputPath
         };
         var output = await ProcessUtil.Capture(ffprobePath, args);
         using var document = JsonDocument.Parse(output);
         var stream = document.RootElement.GetProperty("streams")[0];
+        var format = document.RootElement.TryGetProperty("format", out var formatElement)
+            ? formatElement
+            : default;
         return new MediaProbe(
             GetString(stream, "codec_name") ?? "",
             GetString(stream, "pix_fmt") ?? "",
             GetInt(stream, "width"),
             GetInt(stream, "height"),
+            GetDouble(format, "duration"),
             GetString(stream, "color_space"),
             GetString(stream, "color_transfer"),
             GetString(stream, "color_primaries"));
@@ -257,6 +263,24 @@ public sealed record MediaProbe(
         element.TryGetProperty(property, out var value) && value.TryGetInt32(out var result)
             ? result
             : 0;
+
+    private static double GetDouble(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value))
+        {
+            return 0;
+        }
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var numeric))
+        {
+            return numeric;
+        }
+        if (value.ValueKind == JsonValueKind.String &&
+            double.TryParse(value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return parsed;
+        }
+        return 0;
+    }
 }
 
 public sealed record RouteDecision(bool Route, string Reason)
@@ -314,15 +338,22 @@ public static class AndroidTranscode
         const int startupSegmentSeconds = 1;
         var outputName = Path.GetFileName(command.OutputPath!);
         var segmentName = Path.GetFileName(command.HlsSegmentFilename ?? Path.ChangeExtension(command.OutputPath!, ".ts"));
-        return
-        [
+        var args = new List<string>
+        {
             "-hide_banner",
             "-loglevel", "warning",
             "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
             "-hwaccel", "mediacodec",
             "-hwaccel_device", "mc",
             "-hwaccel_output_format", "mediacodec",
-            "-i", "{input}",
+            "-i", "{input}"
+        };
+        if (probe.DurationSeconds > 0)
+        {
+            args.Add("-t");
+            args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+        }
+        args.AddRange([
             "-map", "0:v:0",
             "-c:v", "h264_mediacodec",
             "-pix_fmt", "mediacodec",
@@ -342,7 +373,8 @@ public static class AndroidTranscode
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", "{outputRoot}/" + segmentName,
             "-y", "{outputRoot}/" + outputName
-        ];
+        ]);
+        return args;
     }
 
     private static (int Width, int Height) OutputDimensions(FfmpegCommand command, MediaProbe probe)

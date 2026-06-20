@@ -58,9 +58,9 @@ public sealed class FfmpegCommandTests
         {
             var command = FfmpegCommand.Parse(Split($"""-i file:{path} -codec:v:0 libx264 -f hls -y /cache/transcodes/id.m3u8"""));
 
-            Assert.True(RouteDecision.Decide(command, new MediaProbe("hevc", "yuv420p10le", 3840, 2160, "bt2020nc", "smpte2084", "bt2020")).Route);
-            Assert.True(RouteDecision.Decide(command, new MediaProbe("av1", "yuv420p10le", 3840, 2160, "bt2020nc", "smpte2084", "bt2020")).Route);
-            Assert.False(RouteDecision.Decide(command, new MediaProbe("h264", "yuv420p", 1920, 1080, "bt709", "bt709", "bt709")).Route);
+            Assert.True(RouteDecision.Decide(command, new MediaProbe("hevc", "yuv420p10le", 3840, 2160, 7200, "bt2020nc", "smpte2084", "bt2020")).Route);
+            Assert.True(RouteDecision.Decide(command, new MediaProbe("av1", "yuv420p10le", 3840, 2160, 7200, "bt2020nc", "smpte2084", "bt2020")).Route);
+            Assert.False(RouteDecision.Decide(command, new MediaProbe("h264", "yuv420p", 1920, 1080, 7200, "bt709", "bt709", "bt709")).Route);
         }
         finally
         {
