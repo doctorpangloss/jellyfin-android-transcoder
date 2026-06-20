@@ -215,6 +215,7 @@ public sealed record MediaProbe(
     int Width,
     int Height,
     double DurationSeconds,
+    long BitRate,
     string? ColorSpace,
     string? ColorTransfer,
     string? ColorPrimaries)
@@ -231,7 +232,7 @@ public sealed record MediaProbe(
         {
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name,pix_fmt,width,height,color_space,color_transfer,color_primaries:format=duration",
+            "-show_entries", "stream=codec_name,pix_fmt,width,height,bit_rate,color_space,color_transfer,color_primaries:format=duration",
             "-of", "json",
             inputPath
         };
@@ -247,6 +248,7 @@ public sealed record MediaProbe(
             GetInt(stream, "width"),
             GetInt(stream, "height"),
             GetDouble(format, "duration"),
+            GetLong(stream, "bit_rate"),
             GetString(stream, "color_space"),
             GetString(stream, "color_transfer"),
             GetString(stream, "color_primaries"));
@@ -281,6 +283,24 @@ public sealed record MediaProbe(
         }
         return 0;
     }
+
+    private static long GetLong(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value))
+        {
+            return 0;
+        }
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var numeric))
+        {
+            return numeric;
+        }
+        if (value.ValueKind == JsonValueKind.String &&
+            long.TryParse(value.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return parsed;
+        }
+        return 0;
+    }
 }
 
 public sealed record RouteDecision(bool Route, string Reason)
@@ -306,7 +326,7 @@ public sealed record RouteDecision(bool Route, string Reason)
 public static class AndroidTranscode
 {
     private const int RemoteInputBytesPerSecond = 10_000_000;
-    private const long MinimumRemoteInputBytes = 64L * 1024L * 1024L;
+    private const long MinimumRemoteInputBytes = 8L * 1024L * 1024L;
 
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
@@ -409,7 +429,9 @@ public static class AndroidTranscode
         {
             return fileLength;
         }
-        var durationBudget = (long)Math.Ceiling(probe.DurationSeconds * RemoteInputBytesPerSecond);
+        var durationBudget = probe.BitRate > 0
+            ? (long)Math.Ceiling(probe.DurationSeconds * probe.BitRate / 8.0)
+            : (long)Math.Ceiling(probe.DurationSeconds * RemoteInputBytesPerSecond);
         return Math.Min(fileLength, Math.Max(MinimumRemoteInputBytes, durationBudget));
     }
 }
