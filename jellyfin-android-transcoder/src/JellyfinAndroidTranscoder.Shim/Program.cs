@@ -281,6 +281,8 @@ public sealed record RouteDecision(bool Route, string Reason)
 
 public static class AndroidTranscode
 {
+    private const int RemoteInputBytesPerSecond = 10_000_000;
+
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
         using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
@@ -290,7 +292,8 @@ public static class AndroidTranscode
         request.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
         request.Headers.TryAddWithoutValidation("X-Remote-Args", EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)));
         await using var input = File.OpenRead(command.InputPath!);
-        request.Content = new StreamContent(input);
+        await using var limitedInput = new RateLimitedReadStream(input, RemoteInputBytesPerSecond);
+        request.Content = new StreamContent(limitedInput);
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
@@ -364,6 +367,89 @@ public static class AndroidTranscode
             .TrimEnd('=')
             .Replace('+', '-')
             .Replace('/', '_');
+    }
+}
+
+public sealed class RateLimitedReadStream : Stream
+{
+    private readonly Stream _inner;
+    private readonly long _bytesPerSecond;
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private long _bytesRead;
+
+    public RateLimitedReadStream(Stream inner, long bytesPerSecond)
+    {
+        _inner = inner;
+        _bytesPerSecond = bytesPerSecond;
+    }
+
+    public override bool CanRead => _inner.CanRead;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush() => _inner.Flush();
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        var read = _inner.Read(buffer, offset, count);
+        Throttle(read);
+        return read;
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        var read = await _inner.ReadAsync(buffer, cancellationToken);
+        await ThrottleAsync(read, cancellationToken);
+        return read;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _inner.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
+    private void Throttle(int read)
+    {
+        var delay = DelayAfter(read);
+        if (delay > TimeSpan.Zero)
+        {
+            Thread.Sleep(delay);
+        }
+    }
+
+    private async Task ThrottleAsync(int read, CancellationToken cancellationToken)
+    {
+        var delay = DelayAfter(read);
+        if (delay > TimeSpan.Zero)
+        {
+            await Task.Delay(delay, cancellationToken);
+        }
+    }
+
+    private TimeSpan DelayAfter(int read)
+    {
+        if (read <= 0)
+        {
+            return TimeSpan.Zero;
+        }
+
+        _bytesRead += read;
+        var expected = TimeSpan.FromSeconds(_bytesRead / (double)_bytesPerSecond);
+        return expected > _clock.Elapsed ? expected - _clock.Elapsed : TimeSpan.Zero;
     }
 }
 
