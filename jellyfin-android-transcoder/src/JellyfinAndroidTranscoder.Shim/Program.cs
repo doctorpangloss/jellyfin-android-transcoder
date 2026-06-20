@@ -407,7 +407,6 @@ public static class AndroidTranscode
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", "{outputRoot}/" + segmentName
         ]);
-        AddPreservedOption(args, command, "-start_number");
         AddPreservedOption(args, command, "-hls_playlist_type");
         AddPreservedOption(args, command, "-hls_list_size");
         args.AddRange(["-y", "{outputRoot}/" + outputName]);
