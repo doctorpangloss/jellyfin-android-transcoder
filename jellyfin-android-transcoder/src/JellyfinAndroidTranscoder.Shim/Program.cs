@@ -333,6 +333,7 @@ public static class AndroidTranscode
 {
     private const int RemoteInputBytesPerSecond = 10_000_000;
     private const long MinimumRemoteInputBytes = 8L * 1024L * 1024L;
+    private static readonly TimeSpan RemoteStartupTimeout = TimeSpan.FromSeconds(8);
 
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
@@ -347,7 +348,8 @@ public static class AndroidTranscode
         await using var limitedInput = new RateLimitedReadStream(boundedInput, RemoteInputBytesPerSecond);
         request.Content = new StreamContent(limitedInput);
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        using var startupTimeout = new CancellationTokenSource(RemoteStartupTimeout);
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, startupTimeout.Token);
         response.EnsureSuccessStatusCode();
 
         var boundary = MultipartUtil.GetBoundary(response.Content.Headers.ContentType?.ToString()
