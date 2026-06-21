@@ -62,6 +62,9 @@ public final class TranscoderServiceInstrumentedTest {
         assertTrue(result.body.contains("\"HiddenSwitch Android Transcoder\""));
         assertTrue(result.body.contains("\"hardware\":\"mediacodec-gles\""));
         assertTrue(result.body.contains("\"tokenRequired\":true"));
+        assertTrue(result.body.contains("\"jobs\":"));
+        assertTrue(result.body.contains("\"jobIdleTimeoutMillis\":"));
+        assertTrue(result.body.contains("\"jobMaxRuntimeMillis\":"));
     }
 
     @Test
@@ -146,6 +149,19 @@ public final class TranscoderServiceInstrumentedTest {
 
         assertEquals(200, result.status);
         assertTrue(result.contentType, result.contentType.startsWith("multipart/mixed"));
+    }
+
+    @Test
+    public void testCancelCurrentRemoteProcessEndpointIsIdempotentWhenIdle() throws Exception {
+        HttpResult result = request("DELETE",
+                "/api/v1/remoteprocesses/current",
+                "Bearer " + AppConfig.token(context),
+                null,
+                null);
+
+        assertEquals(404, result.status);
+        assertTrue(result.body.contains("\"canceled\":false"));
+        assertTrue(result.body.contains("\"no active job\""));
     }
 
     @Test

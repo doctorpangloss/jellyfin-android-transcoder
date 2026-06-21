@@ -43,15 +43,19 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class TranscoderService extends Service {
     public static final String ACTION_REFRESH_POWER = "com.hiddenswitch.androidtranscoder.REFRESH_POWER";
     private static final String CHANNEL = "transcoder";
     private static final String TAG = "AndroidTranscoder";
+    private static final long JOB_IDLE_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(90);
+    private static final long JOB_MAX_RUNTIME_MS = TimeUnit.MINUTES.toMillis(30);
     private static final AtomicInteger ACTIVE_JOBS = new AtomicInteger();
     private static final AtomicInteger ACCEPTED_JOBS = new AtomicInteger();
     private static final AtomicInteger COMPLETED_JOBS = new AtomicInteger();
     private static final AtomicLong INPUT_BYTES = new AtomicLong();
+    private static final AtomicReference<JobState> CURRENT_JOB = new AtomicReference<>();
     private static volatile boolean running;
 
     private ExecutorService executor;
@@ -189,6 +193,10 @@ public class TranscoderService extends Service {
                 writeText(out, 401, "unauthorized\n");
                 return;
             }
+            if (request.path.equals("/api/v1/remoteprocesses/current") && request.method.equals("DELETE")) {
+                cancelCurrentJob(out);
+                return;
+            }
             if (request.path.equals("/api/v1/remoteprocesses") && request.method.equals("POST")) {
                 remoteProcess(request, in, out);
                 return;
@@ -210,6 +218,7 @@ public class TranscoderService extends Service {
     }
 
     private JSONObject statusJson() throws Exception {
+        reapStaleJob("status");
         JSONObject obj = new JSONObject();
         obj.put("name", "HiddenSwitch Android Transcoder");
         obj.put("version", "0.1.0");
@@ -222,6 +231,14 @@ public class TranscoderService extends Service {
         obj.put("tokenRequired", true);
         obj.put("startOnBoot", AppConfig.startOnBoot(this));
         obj.put("keepAwake", AppConfig.keepAwake(this));
+        JSONArray jobs = new JSONArray();
+        JobState job = CURRENT_JOB.get();
+        if (job != null) {
+            jobs.put(job.toJson());
+        }
+        obj.put("jobs", jobs);
+        obj.put("jobIdleTimeoutMillis", JOB_IDLE_TIMEOUT_MS);
+        obj.put("jobMaxRuntimeMillis", JOB_MAX_RUNTIME_MS);
         obj.put("capabilities", new JSONObject()
                 .put("api", "remoteprocesses")
                 .put("output", "multipart/mixed")
@@ -231,23 +248,26 @@ public class TranscoderService extends Service {
     }
 
     private void remoteProcess(Request request, InputStream requestBody, OutputStream response) throws Exception {
-        if (!ACTIVE_JOBS.compareAndSet(0, 1)) {
+        reapStaleJob("new request");
+        JobState job = new JobState(UUID.randomUUID().toString(), new File(getCacheDir(), "remoteprocesses/" + UUID.randomUUID()));
+        if (!CURRENT_JOB.compareAndSet(null, job)) {
             writeText(response, 429, "busy\n");
             return;
         }
+        ACTIVE_JOBS.set(1);
         Process process = null;
-        File workDir = new File(getCacheDir(), "remoteprocesses/" + UUID.randomUUID());
         try {
             ACCEPTED_JOBS.incrementAndGet();
-            File outputDir = new File(workDir, "out");
+            File outputDir = new File(job.workDir, "out");
             if (!outputDir.mkdirs() && !outputDir.isDirectory()) {
                 throw new IOException("Failed to create " + outputDir);
             }
             List<String> command = remoteProcessCommand(request, outputDir);
             process = new ProcessBuilder(command).redirectErrorStream(false).start();
+            job.setProcess(process);
             Process child = process;
             StringBuffer stderrText = new StringBuffer();
-            Thread stdin = new Thread(() -> pipeRequestBody(request, requestBody, child), "remoteprocess-stdin");
+            Thread stdin = new Thread(() -> pipeRequestBody(job, request, requestBody, child), "remoteprocess-stdin");
             Thread stdout = new Thread(() -> drainStream(child.getInputStream()), "remoteprocess-stdout");
             Thread stderr = new Thread(() -> logStream(child.getErrorStream(), stderrText), "remoteprocess-stderr");
             stdin.setDaemon(true);
@@ -257,7 +277,7 @@ public class TranscoderService extends Service {
             stdout.start();
             stderr.start();
 
-            int exit = streamMultipartFiles(response, outputDir, child, stderrText);
+            int exit = streamMultipartFiles(response, outputDir, child, stderrText, job);
             stdout.join(2000);
             stderr.join(2000);
             if (exit == 0) {
@@ -267,7 +287,8 @@ public class TranscoderService extends Service {
             if (process != null) {
                 process.destroyForcibly();
             }
-            deleteRecursively(workDir);
+            deleteRecursively(job.workDir);
+            CURRENT_JOB.compareAndSet(job, null);
             ACTIVE_JOBS.set(0);
         }
     }
@@ -321,13 +342,13 @@ public class TranscoderService extends Service {
         }
     }
 
-    private void pipeRequestBody(Request request, InputStream in, Process process) {
+    private void pipeRequestBody(JobState job, Request request, InputStream in, Process process) {
         try (OutputStream stdin = process.getOutputStream()) {
             if ("chunked".equals(request.headers.get("transfer-encoding"))) {
-                copyChunkedRequest(in, stdin);
+                copyChunkedRequest(job, in, stdin);
             } else {
                 long length = Long.parseLong(request.headers.getOrDefault("content-length", "0"));
-                copyFixed(in, stdin, length);
+                copyFixed(job, in, stdin, length);
             }
         } catch (Exception ignored) {
         }
@@ -343,8 +364,12 @@ public class TranscoderService extends Service {
     }
 
     private static void writeJson(OutputStream out, JSONObject json) throws IOException {
+        writeJson(out, 200, json);
+    }
+
+    private static void writeJson(OutputStream out, int status, JSONObject json) throws IOException {
         byte[] body = (json.toString() + "\n").getBytes(StandardCharsets.UTF_8);
-        writeHeaders(out, 200, "application/json", false, body.length);
+        writeHeaders(out, status, "application/json", false, body.length);
         out.write(body);
         out.flush();
     }
@@ -375,13 +400,29 @@ public class TranscoderService extends Service {
         out.flush();
     }
 
-    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process, StringBuffer stderrText) throws IOException, InterruptedException {
+    private void cancelCurrentJob(OutputStream out) throws Exception {
+        JobState job = CURRENT_JOB.get();
+        JSONObject response = new JSONObject();
+        if (job == null) {
+            response.put("canceled", false);
+            response.put("reason", "no active job");
+            writeJson(out, 404, response);
+            return;
+        }
+        job.cancel("api");
+        response.put("canceled", true);
+        response.put("job", job.toJson());
+        writeJson(out, response);
+    }
+
+    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process, StringBuffer stderrText, JobState job) throws IOException, InterruptedException {
         String boundary = "jfat-" + UUID.randomUUID();
         writeHeaders(out, 200, "multipart/mixed; boundary=" + boundary, true);
         Map<String, FileSnapshot> observed = new HashMap<>();
         Set<String> sent = new HashSet<>();
         while (process.isAlive()) {
-            streamStableFiles(out, outputDir, boundary, observed, sent);
+            enforceLiveness(job, process);
+            streamStableFiles(out, outputDir, boundary, observed, sent, job);
             Thread.sleep(100);
         }
         if (!process.waitFor(120, TimeUnit.SECONDS)) {
@@ -390,14 +431,46 @@ public class TranscoderService extends Service {
         }
         int exitCode = process.exitValue();
         for (int i = 0; i < 5; i++) {
-            streamStableFiles(out, outputDir, boundary, observed, sent);
+            streamStableFiles(out, outputDir, boundary, observed, sent, job);
             Thread.sleep(100);
         }
         writeExitPart(out, boundary, exitCode, stderrText.toString());
         return exitCode;
     }
 
-    private static void streamStableFiles(OutputStream out, File outputDir, String boundary, Map<String, FileSnapshot> observed, Set<String> sent) throws IOException {
+    private static void enforceLiveness(JobState job, Process process) throws IOException {
+        long age = job.ageMillis();
+        long idle = job.idleMillis();
+        if (age > JOB_MAX_RUNTIME_MS) {
+            job.cancel("max-runtime");
+            throw new IOException("remote process exceeded max runtime");
+        }
+        if (idle > JOB_IDLE_TIMEOUT_MS) {
+            job.cancel("idle-timeout");
+            throw new IOException("remote process idle timeout");
+        }
+        if (!process.isAlive()) {
+            job.touchOutput();
+        }
+    }
+
+    private void reapStaleJob(String reason) {
+        JobState job = CURRENT_JOB.get();
+        if (job == null) {
+            return;
+        }
+        Process process = job.process;
+        if ((process != null && !process.isAlive()) || job.ageMillis() > JOB_MAX_RUNTIME_MS || job.idleMillis() > JOB_IDLE_TIMEOUT_MS) {
+            Log.w(TAG, "Reaping stale remote process " + job.id + " during " + reason);
+            job.cancel("reaped-" + reason);
+            if (CURRENT_JOB.compareAndSet(job, null)) {
+                deleteRecursively(job.workDir);
+                ACTIVE_JOBS.set(0);
+            }
+        }
+    }
+
+    private static void streamStableFiles(OutputStream out, File outputDir, String boundary, Map<String, FileSnapshot> observed, Set<String> sent, JobState job) throws IOException {
         for (File file : listFiles(outputDir)) {
             String relative = outputDir.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/');
             FileSnapshot snapshot = new FileSnapshot(file.length(), file.lastModified());
@@ -410,6 +483,7 @@ public class TranscoderService extends Service {
                 continue;
             }
             writeFilePart(out, boundary, outputDir, file, relative);
+            job.addOutputFile();
         }
     }
 
@@ -511,6 +585,75 @@ public class TranscoderService extends Service {
         }
     }
 
+    private static final class JobState {
+        final String id;
+        final File workDir;
+        final long startedAtMillis;
+        final AtomicLong inputBytes = new AtomicLong();
+        final AtomicLong outputFiles = new AtomicLong();
+        volatile long lastActivityMillis;
+        volatile String cancelReason = "";
+        volatile Process process;
+
+        JobState(String id, File workDir) {
+            this.id = id;
+            this.workDir = workDir;
+            this.startedAtMillis = System.currentTimeMillis();
+            this.lastActivityMillis = startedAtMillis;
+        }
+
+        void setProcess(Process process) {
+            this.process = process;
+            touch();
+        }
+
+        void addInputBytes(long bytes) {
+            inputBytes.addAndGet(bytes);
+            touch();
+        }
+
+        void addOutputFile() {
+            outputFiles.incrementAndGet();
+            touch();
+        }
+
+        void touchOutput() {
+            touch();
+        }
+
+        private void touch() {
+            lastActivityMillis = System.currentTimeMillis();
+        }
+
+        long ageMillis() {
+            return Math.max(0, System.currentTimeMillis() - startedAtMillis);
+        }
+
+        long idleMillis() {
+            return Math.max(0, System.currentTimeMillis() - lastActivityMillis);
+        }
+
+        void cancel(String reason) {
+            cancelReason = reason;
+            Process activeProcess = process;
+            if (activeProcess != null) {
+                activeProcess.destroyForcibly();
+            }
+        }
+
+        JSONObject toJson() throws Exception {
+            Process activeProcess = process;
+            return new JSONObject()
+                    .put("id", id)
+                    .put("ageMillis", ageMillis())
+                    .put("idleMillis", idleMillis())
+                    .put("inputBytes", inputBytes.get())
+                    .put("outputFiles", outputFiles.get())
+                    .put("processAlive", activeProcess != null && activeProcess.isAlive())
+                    .put("cancelReason", cancelReason);
+        }
+    }
+
     private static void pipeChunked(InputStream in, OutputStream out) throws IOException {
         byte[] buffer = new byte[65536];
         int read;
@@ -528,7 +671,7 @@ public class TranscoderService extends Service {
         out.flush();
     }
 
-    private static void copyChunkedRequest(InputStream in, OutputStream out) throws IOException {
+    private static void copyChunkedRequest(JobState job, InputStream in, OutputStream out) throws IOException {
         while (true) {
             String sizeLine = readLine(in);
             if (sizeLine == null) {
@@ -541,12 +684,12 @@ public class TranscoderService extends Service {
                 readLine(in);
                 return;
             }
-            copyFixed(in, out, size);
+            copyFixed(job, in, out, size);
             readLine(in);
         }
     }
 
-    private static void copyFixed(InputStream in, OutputStream out, long length) throws IOException {
+    private static void copyFixed(JobState job, InputStream in, OutputStream out, long length) throws IOException {
         byte[] buffer = new byte[65536];
         long remaining = length;
         while (remaining > 0) {
@@ -556,6 +699,7 @@ public class TranscoderService extends Service {
             }
             out.write(buffer, 0, read);
             INPUT_BYTES.addAndGet(read);
+            job.addInputBytes(read);
             remaining -= read;
         }
     }
