@@ -30,7 +30,14 @@ public static class Program
             }
 
             Console.Error.WriteLine($"jfat: routing {probe.CodecName}/{probe.PixelFormat} through {config.AndroidBaseUrl}");
-            return await AndroidTranscode.Run(config, command, probe);
+            var remoteExit = await AndroidTranscode.Run(config, command, probe);
+            if (remoteExit == 0)
+            {
+                return 0;
+            }
+
+            Console.Error.WriteLine($"jfat: fallback after android ffmpeg exited {remoteExit}");
+            return await ProcessUtil.Run(config.RealFfmpegPath, args);
         }
         catch (Exception ex)
         {
