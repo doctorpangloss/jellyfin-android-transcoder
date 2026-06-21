@@ -51,6 +51,43 @@ public sealed class FfmpegCommandTests
     }
 
     [Fact]
+    public void ParsesInceptionSafariTranscodeCommand()
+    {
+        string[] args =
+        [
+            "-analyzeduration", "200M", "-probesize", "1G", "-i",
+            "file:/media/movies/Inception (2010)/Inception (2010) Remux-2160p.mkv",
+            "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+            "-map", "0:0", "-map", "-0:s", "-codec:v:0", "libx264",
+            "-preset", "veryfast", "-crf", "23",
+            "-maxrate", "63810668", "-bufsize", "127621336", "-profile:v:0", "high",
+            "-level", "51", "-force_key_frames:0", "expr:gte(t,n_forced*3)",
+            "-sc_threshold:v:0", "0", "-vf",
+            @"setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,scale=trunc(min(max(iw\,ih*a)\,min(3840\,2160*a))/2)*2:trunc(min(max(iw/a\,ih)\,min(3840/a\,2160))/2)*2,tonemapx=t=bt709",
+            "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
+            "-f", "hls", "-max_delay", "5000000", "-hls_time", "3",
+            "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "70e040ca627b1a5a2ecb0618aa77f67c-1.mp4",
+            "-start_number", "0", "-hls_segment_filename", "/cache/transcodes/70e040ca627b1a5a2ecb0618aa77f67c%d.mp4",
+            "-hls_playlist_type", "vod", "-hls_list_size", "0",
+            "-hls_segment_options", "movflags=+frag_discont",
+            "-y", "/cache/transcodes/70e040ca627b1a5a2ecb0618aa77f67c.m3u8"
+        ];
+
+        var command = FfmpegCommand.Parse(args);
+
+        Assert.True(command.CanConsiderRouting);
+        Assert.Equal("/media/movies/Inception (2010)/Inception (2010) Remux-2160p.mkv", command.InputPath);
+        Assert.Equal("/cache/transcodes/70e040ca627b1a5a2ecb0618aa77f67c.m3u8", command.OutputPath);
+        Assert.Equal(63_810_668, command.MaxRate);
+        Assert.Equal(127_621_336, command.BufSize);
+        Assert.Equal(3840, command.Width);
+        Assert.Equal(2160, command.Height);
+        Assert.Equal("fmp4", command.ValueAfter("-hls_segment_type"));
+        Assert.Equal("70e040ca627b1a5a2ecb0618aa77f67c-1.mp4", command.ValueAfter("-hls_fmp4_init_filename"));
+        Assert.Equal("movflags=+frag_discont", command.ValueAfter("-hls_segment_options"));
+    }
+
+    [Fact]
     public void RoutesHevcAndAv1Only()
     {
         var path = Path.GetTempFileName();

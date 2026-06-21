@@ -250,14 +250,16 @@ public class TranscoderService extends Service {
             Thread stdin = new Thread(() -> pipeRequestBody(request, requestBody, child), "remoteprocess-stdin");
             Thread stdout = new Thread(() -> drainStream(child.getInputStream()), "remoteprocess-stdout");
             Thread stderr = new Thread(() -> logStream(child.getErrorStream(), stderrText), "remoteprocess-stderr");
+            stdin.setDaemon(true);
+            stdout.setDaemon(true);
+            stderr.setDaemon(true);
             stdin.start();
             stdout.start();
             stderr.start();
 
             int exit = streamMultipartFiles(response, outputDir, child, stderrText);
-            stdin.join();
-            stdout.join();
-            stderr.join();
+            stdout.join(2000);
+            stderr.join(2000);
             if (exit == 0) {
                 COMPLETED_JOBS.incrementAndGet();
             }

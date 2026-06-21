@@ -35,6 +35,33 @@ The Android artifact includes native FFmpeg payloads for `arm64-v8a`, `armeabi-v
 
 ## Android Install
 
+### Direct Phone Install
+
+Download the APK on the Android phone. This is the file to install:
+
+```text
+https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.0.0.apk
+```
+
+Scan this QR code on the phone to open the APK download:
+
+![QR code for latest Android APK](docs/assets/android-apk-latest-qr.png)
+
+After the APK downloads:
+
+1. Open the downloaded `jellyfin-android-transcoder-1.0.0.apk` from the browser downloads list or the Android **Files** app.
+2. If Android says the browser or Files app is not allowed to install unknown apps, tap **Settings** on that prompt.
+3. Enable **Allow from this source** for the app you used to open the APK, such as Chrome, Firefox, GitHub, or Files.
+4. Go back to the APK installer.
+5. If Play Protect appears, expand **More details** if needed and choose **Install anyway** or **Continue**. A message like **Play Protect is already turned on** is not the final install confirmation.
+6. Tap **Install**.
+7. After installation, open **Android Transcoder**.
+8. Enable **Start on boot** and **Keep screen and Wi-Fi awake**.
+9. Tap **Start Service**.
+10. Confirm Jellyfin can reach the phone by opening `http://PHONE_IP:8098/api/v1/status` from the Jellyfin server or container network.
+
+If Android returns to the downloads screen without showing **App installed**, the APK was not installed. Reopen the APK and finish the prompts above.
+
 ADB install:
 
 ```bash
@@ -55,15 +82,6 @@ java -jar bundletool-all-1.18.3.jar install-apks \
   --apks jellyfin-android-transcoder-1.0.0.apks \
   --device-id <adb-device-id>
 ```
-
-Manual sideload:
-
-1. Copy `jellyfin-android-transcoder-1.0.0.apk` to the phone.
-2. Install it with Android's package installer.
-3. Open **Android Transcoder**.
-4. Press **Start Service**.
-5. Optionally enable **Start on boot** and **Keep screen and Wi-Fi awake**.
-6. Copy the Plugin JSON shown in the app.
 
 The app must be reachable from the Jellyfin container. On Tailscale, use the phone's Tailscale IP in the plugin JSON or Jellyfin plugin settings.
 

@@ -71,8 +71,10 @@ JSON
         Assert.Contains("\"-g\",\"24\"", request.RemoteArgs);
         Assert.Contains("\"-hls_time\",\"1\"", request.RemoteArgs);
         Assert.Contains("\"-hls_flags\",\"temp_file\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_segment_type\",\"fmp4\"", request.RemoteArgs);
         Assert.Contains("\"-hls_playlist_type\",\"vod\"", request.RemoteArgs);
         Assert.Contains("\"-hls_list_size\",\"0\"", request.RemoteArgs);
+        Assert.Equal(1, android.StatusRequestCount);
         Assert.Equal(2, CountOccurrences(request.RemoteArgs, "\"-t\",\"12.345\""));
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
@@ -126,6 +128,64 @@ JSON
         var request = await android.GetSingleRequest();
         Assert.Equal(File.ReadAllText(input).Length, request.BodyLength);
         Assert.StartsWith("streaming-input-", Encoding.UTF8.GetString(request.BodyPrefix));
+    }
+
+    [Fact]
+    public async Task InceptionSafariCommandRoutesAsFmp4At1080pSixMegabit()
+    {
+        var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"9.5"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "inception-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "Inception (2010) Remux-2160p.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("inception-hevc-data-", 1024)));
+        var output = Path.Combine(_tempDir, "70e040ca627b1a5a2ecb0618aa77f67c.m3u8");
+        var init = Path.Combine(_tempDir, "70e040ca627b1a5a2ecb0618aa77f67c-1.mp4");
+        var segment = Path.Combine(_tempDir, "70e040ca627b1a5a2ecb0618aa77f67c0.mp4");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["70e040ca627b1a5a2ecb0618aa77f67c-1.mp4"] = "fmp4-init"u8.ToArray(),
+            ["70e040ca627b1a5a2ecb0618aa77f67c0.mp4"] = "fmp4-media"u8.ToArray(),
+            ["70e040ca627b1a5a2ecb0618aa77f67c.m3u8"] =
+                "#EXTM3U\n#EXT-X-MAP:URI=\"70e040ca627b1a5a2ecb0618aa77f67c-1.mp4\"\n#EXTINF:1.000,\n70e040ca627b1a5a2ecb0618aa77f67c0.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main(InceptionSafariArgs(input, output));
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", await File.ReadAllTextAsync(ffmpegLog));
+        Assert.Equal("fmp4-init", await File.ReadAllTextAsync(init));
+        Assert.Equal("fmp4-media", await File.ReadAllTextAsync(segment));
+
+        var request = await android.GetSingleRequest();
+        Assert.Equal(1, android.StatusRequestCount);
+        Assert.Contains("\"-output_width\",\"1920\"", request.RemoteArgs);
+        Assert.Contains("\"-output_height\",\"1080\"", request.RemoteArgs);
+        Assert.Contains("\"-b:v\",\"6000000\"", request.RemoteArgs);
+        Assert.Contains("\"-maxrate\",\"6000000\"", request.RemoteArgs);
+        Assert.Contains("\"-bufsize\",\"12000000\"", request.RemoteArgs);
+        Assert.DoesNotContain("63810668", request.RemoteArgs);
+        Assert.DoesNotContain("127621336", request.RemoteArgs);
+        Assert.Contains("\"-hls_segment_type\",\"fmp4\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_fmp4_init_filename\",\"{outputRoot}/70e040ca627b1a5a2ecb0618aa77f67c-1.mp4\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_segment_options\",\"movflags=\\u002Bfrag_discont\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_segment_filename\",\"{outputRoot}/70e040ca627b1a5a2ecb0618aa77f67c%d.mp4\"", request.RemoteArgs);
+        Assert.Contains("\"-y\",\"{outputRoot}/70e040ca627b1a5a2ecb0618aa77f67c.m3u8\"", request.RemoteArgs);
     }
 
     [Fact]
@@ -222,6 +282,25 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
         "-y", output
     ];
 
+    private static string[] InceptionSafariArgs(string input, string output) =>
+    [
+        "-analyzeduration", "200M", "-probesize", "1G", "-i", $"file:{input}",
+        "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+        "-map", "0:0", "-map", "-0:s", "-codec:v:0", "libx264",
+        "-preset", "veryfast", "-crf", "23",
+        "-maxrate", "63810668", "-bufsize", "127621336", "-profile:v:0", "high",
+        "-level", "51", "-force_key_frames:0", "expr:gte(t,n_forced*3)",
+        "-sc_threshold:v:0", "0", "-vf",
+        @"setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,scale=trunc(min(max(iw\,ih*a)\,min(3840\,2160*a))/2)*2:trunc(min(max(iw/a\,ih)\,min(3840/a\,2160))/2)*2,tonemapx=t=bt709",
+        "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
+        "-f", "hls", "-max_delay", "5000000", "-hls_time", "3",
+        "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "70e040ca627b1a5a2ecb0618aa77f67c-1.mp4",
+        "-start_number", "0", "-hls_segment_filename",
+        Path.Combine(Path.GetDirectoryName(output)!, "70e040ca627b1a5a2ecb0618aa77f67c%d.mp4"),
+        "-hls_playlist_type", "vod", "-hls_list_size", "0",
+        "-hls_segment_options", "movflags=+frag_discont", "-y", output
+    ];
+
     private static async Task<string> BuildShimExecutable()
     {
         if (s_shimExecutable is not null)
@@ -315,6 +394,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
                 }
             }
         }
+        public int StatusRequestCount { get; private set; }
 
         public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files)
         {
@@ -361,6 +441,18 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
             while (_listener.IsListening)
             {
                 var context = await _listener.GetContextAsync();
+                if (context.Request.Url?.AbsolutePath == "/api/v1/status")
+                {
+                    StatusRequestCount++;
+                    var body = Encoding.UTF8.GetBytes("""{"activeJobs":0,"maxJobs":1}""");
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "application/json";
+                    context.Response.ContentLength64 = body.Length;
+                    await context.Response.OutputStream.WriteAsync(body);
+                    context.Response.Close();
+                    continue;
+                }
+
                 var request = new AndroidRequest(
                     context.Request.Url?.AbsolutePath ?? "",
                     context.Request.Headers["Authorization"] ?? "",

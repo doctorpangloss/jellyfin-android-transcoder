@@ -189,6 +189,10 @@ public sealed class FfmpegCommand
             return null;
         }
         var match = Regex.Match(vf, @"min\(max\(iw\\,ih\*a\)\\,([0-9]+)\)");
+        if (!match.Success)
+        {
+            match = Regex.Match(vf, @"min\(max\(iw\\,ih\*a\)\\,min\(([0-9]+)\\,");
+        }
         return match.Success ? int.Parse(match.Groups[1].Value) : null;
     }
 
@@ -340,9 +344,52 @@ public static class AndroidTranscode
 {
     private const int RemoteInputBytesPerSecond = 10_000_000;
     private const long MinimumRemoteInputBytes = 8L * 1024L * 1024L;
-    private static readonly TimeSpan RemoteStartupTimeout = TimeSpan.FromSeconds(8);
+    private const int RemoteAttempts = 2;
+    private static readonly TimeSpan HealthCheckTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan RemoteStartupTimeout = TimeSpan.FromSeconds(45);
 
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
+    {
+        if (!await HealthCheck(config))
+        {
+            throw new TimeoutException($"Android health check did not respond within {HealthCheckTimeout.TotalSeconds:0} seconds");
+        }
+
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await RunOnce(config, command, probe);
+            }
+            catch (OperationCanceledException) when (attempt < RemoteAttempts)
+            {
+                Console.Error.WriteLine($"jfat: android startup timed out, retrying ({attempt + 1}/{RemoteAttempts})");
+            }
+        }
+    }
+
+    private static async Task<bool> HealthCheck(ShimConfig config)
+    {
+        using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        using var timeout = new CancellationTokenSource(HealthCheckTimeout);
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{config.AndroidBaseUrl.TrimEnd('/')}/api/v1/status");
+        if (!string.IsNullOrWhiteSpace(config.Token))
+        {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
+        }
+
+        try
+        {
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task<int> RunOnce(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
         using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         var uri = new Uri($"{config.AndroidBaseUrl.TrimEnd('/')}/api/v1/remoteprocesses");
@@ -375,6 +422,9 @@ public static class AndroidTranscode
         const int startupSegmentSeconds = 1;
         var outputName = Path.GetFileName(command.OutputPath!);
         var segmentName = Path.GetFileName(command.HlsSegmentFilename ?? Path.ChangeExtension(command.OutputPath!, ".ts"));
+        var hlsSegmentType = string.Equals(command.ValueAfter("-hls_segment_type"), "fmp4", StringComparison.OrdinalIgnoreCase)
+            ? "fmp4"
+            : "mpegts";
         var args = new List<string>
         {
             "-hide_banner",
@@ -404,7 +454,7 @@ public static class AndroidTranscode
             "-surface_tonemap", toneMap.ToString(),
             "-b:v", bitrate.ToString(),
             "-maxrate", bitrate.ToString(),
-            "-bufsize", Math.Max(command.BufSize, bitrate * 2).ToString(),
+            "-bufsize", (bitrate * 2).ToString(),
             "-bitrate_mode", "cbr",
             "-g", "24",
             "-an",
@@ -413,9 +463,15 @@ public static class AndroidTranscode
             "-f", "hls",
             "-hls_time", startupSegmentSeconds.ToString(),
             "-hls_flags", HlsFlagsWithTempFile(command),
-            "-hls_segment_type", "mpegts",
+            "-hls_segment_type", hlsSegmentType,
             "-hls_segment_filename", "{outputRoot}/" + segmentName
         ]);
+        AddPreservedOption(args, command, "-start_number");
+        if (hlsSegmentType == "fmp4")
+        {
+            AddPreservedOption(args, command, "-hls_fmp4_init_filename", value => "{outputRoot}/" + Path.GetFileName(value));
+            AddPreservedOption(args, command, "-hls_segment_options");
+        }
         AddPreservedOption(args, command, "-hls_playlist_type");
         AddPreservedOption(args, command, "-hls_list_size");
         args.AddRange(["-y", "{outputRoot}/" + outputName]);
@@ -436,25 +492,34 @@ public static class AndroidTranscode
 
     private static void AddPreservedOption(List<string> args, FfmpegCommand command, string option)
     {
+        AddPreservedOption(args, command, option, value => value);
+    }
+
+    private static void AddPreservedOption(List<string> args, FfmpegCommand command, string option, Func<string, string> transform)
+    {
         var value = command.ValueAfter(option);
         if (!string.IsNullOrWhiteSpace(value))
         {
             args.Add(option);
-            args.Add(value);
+            args.Add(transform(value));
         }
     }
 
     private static (int Width, int Height) OutputDimensions(FfmpegCommand command, MediaProbe probe)
     {
+        const int maxWidth = 1920;
+        const int maxHeight = 1080;
         if (probe.Width <= 0 || probe.Height <= 0)
         {
-            return (command.Width, command.Height);
+            return (Math.Min(command.Width, maxWidth), Math.Min(command.Height, maxHeight));
         }
-        if (command.Width <= probe.Width && command.Height <= probe.Height)
+        var width = Math.Min(command.Width, maxWidth);
+        var height = Math.Min(command.Height, maxHeight);
+        if (width <= probe.Width && height <= probe.Height)
         {
-            return (command.Width, command.Height);
+            return (Even(width), Even(height));
         }
-        return (Even(probe.Width), Even(probe.Height));
+        return (Even(Math.Min(probe.Width, maxWidth)), Even(Math.Min(probe.Height, maxHeight)));
     }
 
     private static int Even(int value) => Math.Max(2, value / 2 * 2);
