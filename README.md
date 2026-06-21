@@ -2,66 +2,161 @@
 
 Android MediaCodec transcode bridge for Jellyfin.
 
-This repository contains:
+This repository contains the deployable Android worker app and Jellyfin plugin/shim. The patched FFmpeg source lives in a separate public fork, and the full Jellyfin + Android emulator validation lives in a separate integration repository.
 
-- `android-transcoder/`: Android APK that runs the patched Android FFmpeg build as a foreground HTTP service.
-- `jellyfin-android-transcoder/`: Jellyfin plugin plus `jfat-ffmpeg` shim. Jellyfin calls the shim as FFmpeg; supported HEVC/AV1 video transcodes are routed to Android hardware encode, while unsupported commands fall back to Jellyfin's normal FFmpeg.
+Related repositories:
 
-Build:
+- Android worker + Jellyfin plugin: https://github.com/doctorpangloss/jellyfin-android-transcoder
+- Patched FFmpeg fork: https://github.com/doctorpangloss/forks-ffmpeg-android
+- Integration tests: https://github.com/doctorpangloss/jellyfin-android-transcoder-integration
+
+## What It Does
+
+Jellyfin still invokes an FFmpeg-shaped executable. The plugin installs `jfat-ffmpeg` as a shim, and the shim preserves Jellyfin's normal HLS output contract while routing eligible HEVC/AV1 video transcodes to an Android foreground service.
+
+The Android service exposes:
+
+- `GET /api/v1/status`
+- `POST /api/v1/remoteprocesses`
+
+The remote process endpoint starts bundled patched FFmpeg, streams input into FFmpeg stdin, and streams completed HLS files back to the shim as `multipart/mixed`. Unsupported Jellyfin commands fall back to the configured real FFmpeg path.
+
+## Release Assets
+
+The `v1.0.0` release publishes:
+
+- `jellyfin-android-transcoder-1.0.0.apk`: direct sideload APK.
+- `jellyfin-android-transcoder-1.0.0.aab`: Android App Bundle for bundletool/Play-style installs.
+- `Jellyfin.Plugin.AndroidTranscoder-1.0.0.zip`: Jellyfin plugin zip.
+- `manifest.json`: Jellyfin plugin repository manifest.
+- `SHA256SUMS`: release checksums.
+
+The Android artifact includes native FFmpeg payloads for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`.
+
+## Android Install
+
+ADB install:
 
 ```bash
-dotnet build JellyfinAndroidTranscoder.sln
-dotnet test JellyfinAndroidTranscoder.sln
-cd android-transcoder
-ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleDebug
+adb install -r jellyfin-android-transcoder-1.0.0.apk
+adb shell monkey -p com.hiddenswitch.androidtranscoder 1
 ```
 
-Build the Android App Bundle:
+Bundletool install from the AAB:
 
 ```bash
-FFMPEG_SRC=/path/to/forks-ffmpeg-android \
-  ANDROID_NDK_ROOT=/path/to/android-ndk-r27d \
-  scripts/build-android-ffmpeg.sh
+java -jar bundletool-all-1.18.3.jar build-apks \
+  --bundle jellyfin-android-transcoder-1.0.0.aab \
+  --output jellyfin-android-transcoder-1.0.0.apks \
+  --mode universal \
+  --overwrite
 
-cd android-transcoder
-ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew bundleDebug
-ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew bundleRelease
+java -jar bundletool-all-1.18.3.jar install-apks \
+  --apks jellyfin-android-transcoder-1.0.0.apks \
+  --device-id <adb-device-id>
 ```
 
-The bundles are written to:
+Manual sideload:
+
+1. Copy `jellyfin-android-transcoder-1.0.0.apk` to the phone.
+2. Install it with Android's package installer.
+3. Open **Android Transcoder**.
+4. Press **Start Service**.
+5. Optionally enable **Start on boot** and **Keep screen and Wi-Fi awake**.
+6. Copy the Plugin JSON shown in the app.
+
+The app must be reachable from the Jellyfin container. On Tailscale, use the phone's Tailscale IP in the plugin JSON or Jellyfin plugin settings.
+
+## Jellyfin Docker Compose Example
+
+```yaml
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:10.11.6
+    container_name: jellyfin
+    network_mode: bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8096:8096"
+    volumes:
+      - ./jellyfin-config:/config
+      - ./jellyfin-cache:/cache
+      - /path/to/media:/media:ro
+    restart: unless-stopped
+```
+
+Install the plugin:
+
+1. In Jellyfin, go to **Dashboard -> Plugins -> Repositories**.
+2. Add the repository URL:
+
+   ```text
+   https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/download/v1.0.0/manifest.json
+   ```
+
+3. Install **Android Transcoder** from the catalog, or manually unpack `Jellyfin.Plugin.AndroidTranscoder-1.0.0.zip` into:
+
+   ```text
+   ./jellyfin-config/plugins/Android Transcoder_1.0.0/
+   ```
+
+4. Restart Jellyfin.
+5. Open **Dashboard -> Plugins -> Android Transcoder**.
+6. Paste the Android app JSON and save.
+7. Click **Test Connection**.
+8. Click **Install Shim**.
+9. Click **Use Shim FFmpeg**.
+10. Restart Jellyfin once more after changing the FFmpeg path.
+
+The plugin writes the shim to:
 
 ```text
-android-transcoder/app/build/outputs/bundle/debug/app-debug.aab
-android-transcoder/app/build/outputs/bundle/release/app-release.aab
+/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/jfat-ffmpeg
 ```
 
-The AAB includes native splits for `arm64-v8a`, `armeabi-v7a`, `x86`, and
-`x86_64`. This is the Google-preferred publishing format. For direct installs,
-generate APK sets with `bundletool`; users do not install an `.aab` directly.
-The FFmpeg payload is a single PIE executable per ABI packaged through the
-normal Android native-library layout. FFmpeg libraries are linked into that
-executable, so the app does not depend on `LD_LIBRARY_PATH` or private sibling
-shared-library lookup. The build uses 16 KB page-size linker flags. ARM and
-`x86_64` builds keep assembly optimizations; 32-bit x86 uses a C fallback.
+and writes shim config beside it as `shim-config.json`.
 
-Test the bridge:
+## Build Locally
+
+Prerequisites:
+
+- .NET SDK 9
+- JDK 21
+- Android SDK
+- Android NDK r27d if rebuilding FFmpeg
+- `zip`
+
+Build patched FFmpeg payloads:
 
 ```bash
-dotnet test JellyfinAndroidTranscoder.sln
-cd android-transcoder
-ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleDebug assembleDebugAndroidTest
-ANDROID_HOME="$HOME/Android/Sdk" JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew connectedDebugAndroidTest
+FFMPEG_SRC=/home/administrator/Documents/forks-ffmpeg-android \
+ANDROID_NDK_ROOT=/home/administrator/android-ndk/android-ndk-r27d \
+./scripts/build-android-ffmpeg.sh
 ```
 
-The .NET tests mock the Android HTTP service and verify the Jellyfin FFmpeg shim
-posts the expected request. The Android instrumentation tests install the APK on
-a connected device, start the foreground service, and make Jellyfin-style HTTP
-calls to `127.0.0.1:8098`.
+Build release assets:
 
-The APK is written to:
+```bash
+VERSION=1.0.0 ANDROID_HOME="$HOME/Android/Sdk" ./scripts/package-release.sh
+```
+
+Artifacts are written to `dist/`.
+
+## Test
+
+Component tests:
+
+```bash
+dotnet test JellyfinAndroidTranscoder.sln --nologo
+cd android-transcoder
+ANDROID_HOME="$HOME/Android/Sdk" ./gradlew :app:connectedVanillaAndroidTest
+```
+
+Full integration tests are in:
 
 ```text
-android-transcoder/app/build/outputs/apk/debug/app-debug.apk
+https://github.com/doctorpangloss/jellyfin-android-transcoder-integration
 ```
 
-The Android app shows the host, port, and bearer-token JSON needed by the Jellyfin plugin.
+They start Jellyfin via Testcontainers, start an Android emulator, install the app, install/configure the plugin, add a 1 GiB HEVC fixture, and fetch browser-visible HLS through Jellyfin.
