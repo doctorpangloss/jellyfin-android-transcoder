@@ -7,6 +7,7 @@
 **/.gradle/
 **/build/
 .work/
+dist/
 android-transcoder/local.properties
 android-transcoder/app/release/
 android-transcoder/app/debug/
