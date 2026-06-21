@@ -17,4 +17,8 @@ public sealed class PluginConfiguration : BasePluginConfiguration
     public string ShimPath { get; set; } = "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/jfat-ffmpeg";
 
     public int MaxBitrate { get; set; } = 6_000_000;
+
+    public string PairingCode { get; set; } = string.Empty;
+
+    public DateTime PairingCodeExpiresUtc { get; set; }
 }

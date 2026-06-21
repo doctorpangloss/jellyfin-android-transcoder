@@ -23,6 +23,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -79,6 +81,18 @@ public class TranscoderService extends Service {
         Log.i(TAG, "TranscoderService onStartCommand");
         if (intent != null && intent.hasExtra("token")) {
             AppConfig.setToken(this, intent.getStringExtra("token"));
+        }
+        if (intent != null && intent.hasExtra("startOnBoot")) {
+            AppConfig.setStartOnBoot(this, intent.getBooleanExtra("startOnBoot", false));
+        }
+        if (intent != null && intent.hasExtra("keepAwake")) {
+            AppConfig.setKeepAwake(this, intent.getBooleanExtra("keepAwake", false));
+        }
+        if (intent != null && intent.hasExtra("pairUrl")) {
+            String pairUrl = intent.getStringExtra("pairUrl");
+            if (pairUrl != null && !pairUrl.isEmpty()) {
+                executor.submit(() -> pairWithJellyfin(pairUrl));
+            }
         }
         updatePowerLocks();
         return START_STICKY;
@@ -271,6 +285,38 @@ public class TranscoderService extends Service {
                     .replace("{outputRoot}", outputDir.getAbsolutePath()));
         }
         return command;
+    }
+
+    private void pairWithJellyfin(String pairUrl) {
+        try {
+            JSONObject payload = new JSONObject(AppConfig.connectionJson(this));
+            HttpURLConnection connection = (HttpURLConnection) new URL(pairUrl).openConnection();
+            connection.setRequestMethod("POST");
+            connection.setConnectTimeout(10000);
+            connection.setReadTimeout(10000);
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json");
+            byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
+            connection.setFixedLengthStreamingMode(body.length);
+            try (OutputStream out = connection.getOutputStream()) {
+                out.write(body);
+            }
+            int status = connection.getResponseCode();
+            InputStream response = status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream();
+            String text = response == null ? "" : readAll(response);
+            if (status < 200 || status >= 300) {
+                Log.w(TAG, "Pairing failed: HTTP " + status + " " + text);
+                return;
+            }
+            JSONObject json = new JSONObject(text);
+            String token = json.optString("token", "");
+            if (!token.isEmpty()) {
+                AppConfig.setToken(this, token);
+            }
+            Log.i(TAG, "Paired with Jellyfin at " + pairUrl);
+        } catch (Exception ex) {
+            Log.w(TAG, "Pairing failed", ex);
+        }
     }
 
     private void pipeRequestBody(Request request, InputStream in, Process process) {
@@ -510,6 +556,16 @@ public class TranscoderService extends Service {
             INPUT_BYTES.addAndGet(read);
             remaining -= read;
         }
+    }
+
+    private static String readAll(InputStream in) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int read;
+        while ((read = in.read(buffer)) >= 0) {
+            bytes.write(buffer, 0, read);
+        }
+        return bytes.toString(StandardCharsets.UTF_8.name());
     }
 
     private static void logStream(InputStream in, StringBuffer stderrText) {

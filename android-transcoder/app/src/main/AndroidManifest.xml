@@ -24,7 +24,7 @@
         </activity>
         <service
             android:name=".TranscoderService"
-            android:exported="false"
+            android:exported="true"
             android:foregroundServiceType="mediaProcessing" />
         <receiver
             android:name=".BootReceiver"

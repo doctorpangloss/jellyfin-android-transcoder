@@ -41,10 +41,19 @@
                     <input is="emby-input" id="txtRealFfmpeg" type="text" />
                 </div>
                 <button is="emby-button" type="submit" class="raised button-submit">Save</button>
+                <button is="emby-button" type="button" class="raised" id="btnPair">Generate Pairing Code</button>
                 <button is="emby-button" type="button" class="raised" id="btnTest">Test Connection</button>
                 <button is="emby-button" type="button" class="raised" id="btnInstallShim">Install Shim</button>
                 <button is="emby-button" type="button" class="raised" id="btnApply">Use Shim FFmpeg</button>
                 <button is="emby-button" type="button" class="raised" id="btnRestore">Restore Real FFmpeg</button>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="txtPairingUrl">Pairing URL</label>
+                    <input is="emby-input" id="txtPairingUrl" type="text" readonly />
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="txtPairingCommand">ADB pairing command</label>
+                    <textarea id="txtPairingCommand" class="emby-input" rows="3" readonly></textarea>
+                </div>
                 <pre id="txtStatus"></pre>
             </form>
         </div>
@@ -91,6 +100,14 @@
             show('imported');
         });
         page.querySelector('#btnTest').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/Test') })));
+        page.querySelector('#btnPair').addEventListener('click', async () => {
+            const pairing = await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/Pairing') });
+            const pairUrl = api.getUrl(pairing.path.replace(/^\//, ''));
+            const command = `adb shell am start-foreground-service -n com.hiddenswitch.androidtranscoder/.TranscoderService -e pairUrl "${pairUrl}" --ez startOnBoot true --ez keepAwake true`;
+            page.querySelector('#txtPairingUrl').value = pairUrl;
+            page.querySelector('#txtPairingCommand').value = command;
+            show(pairing);
+        });
         page.querySelector('#btnInstallShim').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/InstallShim') })));
         page.querySelector('#btnApply').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/ApplyFfmpegPath') })));
         page.querySelector('#btnRestore').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/RestoreFfmpegPath') })));
