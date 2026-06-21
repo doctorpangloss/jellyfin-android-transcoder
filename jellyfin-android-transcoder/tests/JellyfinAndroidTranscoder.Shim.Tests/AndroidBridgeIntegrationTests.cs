@@ -182,7 +182,7 @@ JSON
         Assert.DoesNotContain("63810668", request.RemoteArgs);
         Assert.DoesNotContain("127621336", request.RemoteArgs);
         Assert.Contains("\"-hls_segment_type\",\"fmp4\"", request.RemoteArgs);
-        Assert.Contains("\"-hls_fmp4_init_filename\",\"{outputRoot}/70e040ca627b1a5a2ecb0618aa77f67c-1.mp4\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_fmp4_init_filename\",\"70e040ca627b1a5a2ecb0618aa77f67c-1.mp4\"", request.RemoteArgs);
         Assert.Contains("\"-hls_segment_options\",\"movflags=\\u002Bfrag_discont\"", request.RemoteArgs);
         Assert.Contains("\"-hls_segment_filename\",\"{outputRoot}/70e040ca627b1a5a2ecb0618aa77f67c%d.mp4\"", request.RemoteArgs);
         Assert.Contains("\"-y\",\"{outputRoot}/70e040ca627b1a5a2ecb0618aa77f67c.m3u8\"", request.RemoteArgs);
