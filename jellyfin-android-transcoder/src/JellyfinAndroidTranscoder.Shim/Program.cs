@@ -365,6 +365,14 @@ public static class AndroidTranscode
             {
                 Console.Error.WriteLine($"jfat: android startup timed out, retrying ({attempt + 1}/{RemoteAttempts})");
             }
+            catch (HttpRequestException ex) when (attempt < RemoteAttempts)
+            {
+                Console.Error.WriteLine($"jfat: android request failed during startup, retrying ({attempt + 1}/{RemoteAttempts}): {ex.Message}");
+            }
+            catch (IOException ex) when (attempt < RemoteAttempts)
+            {
+                Console.Error.WriteLine($"jfat: android stream failed during startup, retrying ({attempt + 1}/{RemoteAttempts}): {ex.Message}");
+            }
         }
     }
 

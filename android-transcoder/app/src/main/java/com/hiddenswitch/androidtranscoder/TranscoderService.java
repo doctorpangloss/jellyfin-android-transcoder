@@ -56,6 +56,7 @@ public class TranscoderService extends Service {
     private static final AtomicInteger COMPLETED_JOBS = new AtomicInteger();
     private static final AtomicLong INPUT_BYTES = new AtomicLong();
     private static final AtomicReference<JobState> CURRENT_JOB = new AtomicReference<>();
+    private static final AtomicReference<String> LAST_JOB_JSON = new AtomicReference<>("");
     private static volatile boolean running;
 
     private ExecutorService executor;
@@ -237,6 +238,10 @@ public class TranscoderService extends Service {
             jobs.put(job.toJson());
         }
         obj.put("jobs", jobs);
+        String lastJob = LAST_JOB_JSON.get();
+        if (lastJob != null && !lastJob.isEmpty()) {
+            obj.put("lastJob", new JSONObject(lastJob));
+        }
         obj.put("jobIdleTimeoutMillis", JOB_IDLE_TIMEOUT_MS);
         obj.put("jobMaxRuntimeMillis", JOB_MAX_RUNTIME_MS);
         obj.put("capabilities", new JSONObject()
@@ -256,6 +261,9 @@ public class TranscoderService extends Service {
         }
         ACTIVE_JOBS.set(1);
         Process process = null;
+        int exit = -1;
+        String failure = "";
+        StringBuffer stderrText = new StringBuffer();
         try {
             ACCEPTED_JOBS.incrementAndGet();
             File outputDir = new File(job.workDir, "out");
@@ -266,7 +274,6 @@ public class TranscoderService extends Service {
             process = new ProcessBuilder(command).redirectErrorStream(false).start();
             job.setProcess(process);
             Process child = process;
-            StringBuffer stderrText = new StringBuffer();
             Thread stdin = new Thread(() -> pipeRequestBody(job, request, requestBody, child), "remoteprocess-stdin");
             Thread stdout = new Thread(() -> drainStream(child.getInputStream()), "remoteprocess-stdout");
             Thread stderr = new Thread(() -> logStream(child.getErrorStream(), stderrText), "remoteprocess-stderr");
@@ -277,16 +284,20 @@ public class TranscoderService extends Service {
             stdout.start();
             stderr.start();
 
-            int exit = streamMultipartFiles(response, outputDir, child, stderrText, job);
+            exit = streamMultipartFiles(response, outputDir, child, stderrText, job);
             stdout.join(2000);
             stderr.join(2000);
             if (exit == 0) {
                 COMPLETED_JOBS.incrementAndGet();
             }
+        } catch (Exception ex) {
+            failure = ex.getClass().getSimpleName() + ": " + ex.getMessage();
+            throw ex;
         } finally {
             if (process != null) {
                 process.destroyForcibly();
             }
+            LAST_JOB_JSON.set(job.toJson(exit, failure, stderrText.toString()).toString());
             deleteRecursively(job.workDir);
             CURRENT_JOB.compareAndSet(job, null);
             ACTIVE_JOBS.set(0);
@@ -642,8 +653,12 @@ public class TranscoderService extends Service {
         }
 
         JSONObject toJson() throws Exception {
+            return toJson(-1, "", "");
+        }
+
+        JSONObject toJson(int exitCode, String failure, String stderr) throws Exception {
             Process activeProcess = process;
-            return new JSONObject()
+            JSONObject json = new JSONObject()
                     .put("id", id)
                     .put("ageMillis", ageMillis())
                     .put("idleMillis", idleMillis())
@@ -651,6 +666,16 @@ public class TranscoderService extends Service {
                     .put("outputFiles", outputFiles.get())
                     .put("processAlive", activeProcess != null && activeProcess.isAlive())
                     .put("cancelReason", cancelReason);
+            if (exitCode >= 0) {
+                json.put("exitCode", exitCode);
+            }
+            if (!failure.isEmpty()) {
+                json.put("failure", failure);
+            }
+            if (!stderr.isEmpty()) {
+                json.put("stderrTail", stderr.length() <= 4096 ? stderr : stderr.substring(stderr.length() - 4096));
+            }
+            return json;
         }
     }
 

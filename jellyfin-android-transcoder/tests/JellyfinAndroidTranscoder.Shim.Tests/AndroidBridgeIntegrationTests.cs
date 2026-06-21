@@ -189,6 +189,54 @@ JSON
     }
 
     [Fact]
+    public async Task RemoteHttpFailureRetriesAndroidBeforeLocalFallback()
+    {
+        var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"9.5"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "retry-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("large-streaming-input-", 4096)));
+        var output = Path.Combine(_tempDir, "retry.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["retry-1.mp4"] = "fmp4-init-after-retry"u8.ToArray(),
+            ["retry0.mp4"] = "fmp4-media-after-retry"u8.ToArray(),
+            ["retry.m3u8"] = "#EXTM3U\n#EXT-X-MAP:URI=\"retry-1.mp4\"\n#EXTINF:1.000,\nretry0.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
+        }, failFirstRemoteRequest: true);
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main([
+            "-i", $"file:{input}", "-codec:v:0", "libx264", "-maxrate", "63810668", "-bufsize", "127621336",
+            "-vf", @"scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2",
+            "-f", "hls", "-hls_time", "3", "-hls_segment_type", "fmp4",
+            "-hls_fmp4_init_filename", "retry-1.mp4",
+            "-hls_segment_filename", Path.Combine(_tempDir, "retry%d.mp4"),
+            "-hls_playlist_type", "vod", "-hls_list_size", "0", "-y", output
+        ]);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", await File.ReadAllTextAsync(ffmpegLog));
+        Assert.Equal(2, android.RequestCount);
+        Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
+        Assert.Equal("fmp4-media-after-retry", await File.ReadAllTextAsync(Path.Combine(_tempDir, "retry0.mp4")));
+    }
+
+    [Fact]
     public async Task UnsupportedJellyfinCommandFallsBackWithoutCallingAndroid()
     {
         var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
@@ -371,14 +419,16 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
     {
         private readonly HttpListener _listener;
         private readonly IReadOnlyDictionary<string, byte[]> _files;
+        private readonly bool _failFirstRemoteRequest;
         private readonly List<AndroidRequest> _requests = [];
         private readonly Task _serverTask;
 
-        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyDictionary<string, byte[]> files)
+        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest)
         {
             _listener = listener;
             BaseUrl = baseUrl;
             _files = files;
+            _failFirstRemoteRequest = failFirstRemoteRequest;
             _serverTask = Task.Run(Serve);
         }
 
@@ -396,14 +446,14 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
         }
         public int StatusRequestCount { get; private set; }
 
-        public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files)
+        public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest = false)
         {
             var port = GetFreePort();
             var baseUrl = $"http://127.0.0.1:{port}";
             var listener = new HttpListener();
             listener.Prefixes.Add($"{baseUrl}/");
             listener.Start();
-            return Task.FromResult(new MockAndroidService(listener, baseUrl, files));
+            return Task.FromResult(new MockAndroidService(listener, baseUrl, files, failFirstRemoteRequest));
         }
 
         public async Task<AndroidRequest> GetSingleRequest()
@@ -468,6 +518,19 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
                 }
 
                 var requestIndex = RequestCount - 1;
+                if (_failFirstRemoteRequest && requestIndex == 0)
+                {
+                    var buffer = new byte[8192];
+                    _ = await context.Request.InputStream.ReadAsync(buffer);
+                    context.Response.StatusCode = 503;
+                    var body = "remote process closed while upload was active\n"u8.ToArray();
+                    context.Response.ContentType = "text/plain";
+                    context.Response.ContentLength64 = body.Length;
+                    await context.Response.OutputStream.WriteAsync(body);
+                    context.Response.Close();
+                    continue;
+                }
+
                 var drainTask = DrainRequest(context.Request.InputStream, requestIndex);
                 context.Response.StatusCode = 200;
                 var boundary = "test-boundary";
