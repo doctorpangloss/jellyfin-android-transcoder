@@ -149,6 +149,13 @@ public final class TranscoderServiceInstrumentedTest {
 
         assertEquals(200, result.status);
         assertTrue(result.contentType, result.contentType.startsWith("multipart/mixed"));
+        assertTrue(result.body, result.body.contains("\"stdout\""));
+        assertTrue(result.body, result.body.contains("ffmpeg version"));
+
+        HttpResult status = request("GET", "/api/v1/status", null, null);
+        assertEquals(200, status.status);
+        assertTrue(status.body, status.body.contains("\"stdoutTail\""));
+        assertTrue(status.body, status.body.contains("ffmpeg version"));
     }
 
     @Test

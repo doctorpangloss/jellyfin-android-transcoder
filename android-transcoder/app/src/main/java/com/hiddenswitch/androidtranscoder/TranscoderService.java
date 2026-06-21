@@ -275,7 +275,6 @@ public class TranscoderService extends Service {
         Process process = null;
         int exit = -1;
         String failure = "";
-        StringBuffer stderrText = new StringBuffer();
         try {
             ACCEPTED_JOBS.incrementAndGet();
             File outputDir = new File(job.workDir, "out");
@@ -287,8 +286,8 @@ public class TranscoderService extends Service {
             job.setProcess(process);
             Process child = process;
             Thread stdin = new Thread(() -> pipeRequestBody(job, request, requestBody, child), "remoteprocess-stdin");
-            Thread stdout = new Thread(() -> drainStream(child.getInputStream()), "remoteprocess-stdout");
-            Thread stderr = new Thread(() -> logStream(child.getErrorStream(), stderrText), "remoteprocess-stderr");
+            Thread stdout = new Thread(() -> logStream(child.getInputStream(), job.stdoutText, false), "remoteprocess-stdout");
+            Thread stderr = new Thread(() -> logStream(child.getErrorStream(), job.stderrText, true), "remoteprocess-stderr");
             stdin.setDaemon(true);
             stdout.setDaemon(true);
             stderr.setDaemon(true);
@@ -296,7 +295,7 @@ public class TranscoderService extends Service {
             stdout.start();
             stderr.start();
 
-            exit = streamMultipartFiles(response, outputDir, child, stderrText, job);
+            exit = streamMultipartFiles(response, outputDir, child, job.stdoutText, job.stderrText, job);
             stdout.join(2000);
             stderr.join(2000);
             if (exit == 0) {
@@ -309,7 +308,7 @@ public class TranscoderService extends Service {
             if (process != null) {
                 process.destroyForcibly();
             }
-            LAST_JOB_JSON.set(job.toJson(exit, failure, stderrText.toString()).toString());
+            LAST_JOB_JSON.set(job.toJson(exit, failure).toString());
             deleteRecursively(job.workDir);
             CURRENT_JOB.compareAndSet(job, null);
             ACTIVE_JOBS.set(0);
@@ -334,8 +333,8 @@ public class TranscoderService extends Service {
             List<String> command = remoteProcessCommand(request, outputDir);
             Process process = new ProcessBuilder(command).redirectErrorStream(false).start();
             job.setProcess(process);
-            Thread stdout = new Thread(() -> drainStream(process.getInputStream()), "remoteprocess-stdout");
-            Thread stderr = new Thread(() -> logStream(process.getErrorStream(), job.stderrText), "remoteprocess-stderr");
+            Thread stdout = new Thread(() -> logStream(process.getInputStream(), job.stdoutText, false), "remoteprocess-stdout");
+            Thread stderr = new Thread(() -> logStream(process.getErrorStream(), job.stderrText, true), "remoteprocess-stderr");
             stdout.setDaemon(true);
             stderr.setDaemon(true);
             stdout.start();
@@ -346,7 +345,7 @@ public class TranscoderService extends Service {
                     .put("filesUrl", "/api/v1/remoteprocesses/" + job.id + "/files");
             writeJson(response, body);
         } catch (Exception ex) {
-            LAST_JOB_JSON.set(job.toJson(-1, ex.getClass().getSimpleName() + ": " + ex.getMessage(), job.stderrText.toString()).toString());
+            LAST_JOB_JSON.set(job.toJson(-1, ex.getClass().getSimpleName() + ": " + ex.getMessage()).toString());
             deleteRecursively(job.workDir);
             CURRENT_JOB.compareAndSet(job, null);
             ACTIVE_JOBS.set(0);
@@ -380,7 +379,7 @@ public class TranscoderService extends Service {
         int exit = -1;
         String failure = "";
         try {
-            exit = streamMultipartFiles(response, job.outputDir, job.process, job.stderrText, job);
+            exit = streamMultipartFiles(response, job.outputDir, job.process, job.stdoutText, job.stderrText, job);
             if (exit == 0) {
                 COMPLETED_JOBS.incrementAndGet();
             }
@@ -388,7 +387,7 @@ public class TranscoderService extends Service {
             failure = ex.getClass().getSimpleName() + ": " + ex.getMessage();
             throw ex;
         } finally {
-            LAST_JOB_JSON.set(job.toJson(exit, failure, job.stderrText.toString()).toString());
+            LAST_JOB_JSON.set(job.toJson(exit, failure).toString());
             Process process = job.process;
             if (process != null) {
                 process.destroyForcibly();
@@ -470,15 +469,6 @@ public class TranscoderService extends Service {
         }
     }
 
-    private static void drainStream(InputStream in) {
-        try {
-            byte[] buffer = new byte[65536];
-            while (in.read(buffer) >= 0) {
-            }
-        } catch (IOException ignored) {
-        }
-    }
-
     private static void writeJson(OutputStream out, JSONObject json) throws IOException {
         writeJson(out, 200, json);
     }
@@ -531,7 +521,7 @@ public class TranscoderService extends Service {
         writeJson(out, response);
     }
 
-    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process, StringBuffer stderrText, JobState job) throws IOException, InterruptedException {
+    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process, StringBuffer stdoutText, StringBuffer stderrText, JobState job) throws IOException, InterruptedException {
         String boundary = "jfat-" + UUID.randomUUID();
         writeHeaders(out, 200, "multipart/mixed; boundary=" + boundary, true);
         Map<String, FileSnapshot> observed = new HashMap<>();
@@ -550,7 +540,7 @@ public class TranscoderService extends Service {
             streamStableFiles(out, outputDir, boundary, observed, sent, job);
             Thread.sleep(100);
         }
-        writeExitPart(out, boundary, exitCode, stderrText.toString());
+        writeExitPart(out, boundary, exitCode, stdoutText.toString(), stderrText.toString());
         return exitCode;
     }
 
@@ -616,10 +606,11 @@ public class TranscoderService extends Service {
         writeChunk(out, part.toByteArray());
     }
 
-    private static void writeExitPart(OutputStream out, String boundary, int exitCode, String stderr) throws IOException {
+    private static void writeExitPart(OutputStream out, String boundary, int exitCode, String stdout, String stderr) throws IOException {
         JSONObject json = new JSONObject();
         try {
             json.put("exitCode", exitCode);
+            json.put("stdout", stdout);
             json.put("stderr", stderr);
         } catch (Exception ignored) {
         }
@@ -711,6 +702,7 @@ public class TranscoderService extends Service {
         volatile String cancelReason = "";
         volatile Process process;
         volatile File outputDir;
+        final StringBuffer stdoutText = new StringBuffer();
         final StringBuffer stderrText = new StringBuffer();
 
         JobState(String id, File workDir) {
@@ -760,11 +752,13 @@ public class TranscoderService extends Service {
         }
 
         JSONObject toJson() throws Exception {
-            return toJson(-1, "", "");
+            return toJson(-1, "");
         }
 
-        JSONObject toJson(int exitCode, String failure, String stderr) throws Exception {
+        JSONObject toJson(int exitCode, String failure) throws Exception {
             Process activeProcess = process;
+            String stdout = stdoutText.toString();
+            String stderr = stderrText.toString();
             JSONObject json = new JSONObject()
                     .put("id", id)
                     .put("ageMillis", ageMillis())
@@ -779,10 +773,17 @@ public class TranscoderService extends Service {
             if (!failure.isEmpty()) {
                 json.put("failure", failure);
             }
+            if (!stdout.isEmpty()) {
+                json.put("stdoutTail", tail(stdout));
+            }
             if (!stderr.isEmpty()) {
-                json.put("stderrTail", stderr.length() <= 4096 ? stderr : stderr.substring(stderr.length() - 4096));
+                json.put("stderrTail", tail(stderr));
             }
             return json;
+        }
+
+        private static String tail(String text) {
+            return text.length() <= 4096 ? text : text.substring(text.length() - 4096);
         }
     }
 
@@ -846,15 +847,19 @@ public class TranscoderService extends Service {
         return bytes.toString(StandardCharsets.UTF_8.name());
     }
 
-    private static void logStream(InputStream in, StringBuffer stderrText) {
+    private static void logStream(InputStream in, StringBuffer textBuffer, boolean stderr) {
         try {
             ByteArrayOutputStream line = new ByteArrayOutputStream();
             int c;
             while ((c = in.read()) >= 0) {
                 if (c == '\n') {
                     String text = line.toString(StandardCharsets.UTF_8.name());
-                    stderrText.append(text).append('\n');
-                    Log.w(TAG, text);
+                    textBuffer.append(text).append('\n');
+                    if (stderr) {
+                        Log.w(TAG, text);
+                    } else {
+                        Log.i(TAG, text);
+                    }
                     line.reset();
                 } else {
                     line.write(c);
@@ -862,11 +867,15 @@ public class TranscoderService extends Service {
             }
             if (line.size() > 0) {
                 String text = line.toString(StandardCharsets.UTF_8.name());
-                stderrText.append(text).append('\n');
-                Log.w(TAG, text);
+                textBuffer.append(text).append('\n');
+                if (stderr) {
+                    Log.w(TAG, text);
+                } else {
+                    Log.i(TAG, text);
+                }
             }
         } catch (IOException ex) {
-            Log.w(TAG, "Failed reading ffmpeg stderr", ex);
+            Log.w(TAG, "Failed reading ffmpeg " + (stderr ? "stderr" : "stdout"), ex);
         }
     }
 
