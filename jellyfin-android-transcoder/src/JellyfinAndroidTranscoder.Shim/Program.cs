@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Http.Headers;
-using System.Net.Sockets;
+using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Text;
@@ -399,18 +399,45 @@ public static class AndroidTranscode
 
     private static async Task<int> RunOnce(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
+        using var startupTimeout = new CancellationTokenSource(RemoteStartupTimeout);
+        using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        var baseUri = config.AndroidBaseUrl.TrimEnd('/');
+        var job = await StartRemoteProcess(client, baseUri, config.Token, EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)), startupTimeout.Token);
+
         await using var input = File.OpenRead(command.InputPath!);
         await using var limitedInput = new RateLimitedReadStream(input, RemoteInputBytesPerSecond);
-        using var startupTimeout = new CancellationTokenSource(RemoteStartupTimeout);
-        await using (var exchange = await RemoteProcessHttpExchange.Start(
-                         new Uri($"{config.AndroidBaseUrl.TrimEnd('/')}/api/v1/remoteprocesses"),
-                         config.Token,
-                         EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)),
-                         limitedInput,
-                         startupTimeout.Token))
+        using var stdinRequest = new HttpRequestMessage(HttpMethod.Put, baseUri + job.StdinUrl);
+        stdinRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
+        stdinRequest.Content = new StreamContent(limitedInput);
+        stdinRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        var stdinTask = client.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead);
+
+        using var filesRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.FilesUrl);
+        filesRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
+        using var filesResponse = await client.SendAsync(filesRequest, HttpCompletionOption.ResponseHeadersRead, startupTimeout.Token);
+        filesResponse.EnsureSuccessStatusCode();
+        var boundary = MultipartUtil.GetBoundary(filesResponse.Content.Headers.ContentType?.ToString()
+            ?? throw new InvalidOperationException("Missing multipart content type"));
+        await using (var files = await filesResponse.Content.ReadAsStreamAsync(startupTimeout.Token))
         {
-            return await MultipartUtil.MaterializeFiles(exchange.ResponseBody, exchange.Boundary, command);
+            var exit = await MultipartUtil.MaterializeFiles(files, boundary, command);
+            using var stdinResponse = await stdinTask;
+            stdinResponse.EnsureSuccessStatusCode();
+            return exit;
         }
+    }
+
+    private static async Task<RemoteJob> StartRemoteProcess(HttpClient client, string baseUri, string token, string remoteArgs, CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, baseUri + "/api/v1/remoteprocesses");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Headers.TryAddWithoutValidation("X-Remote-Split", "1");
+        request.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
+        request.Headers.TryAddWithoutValidation("X-Remote-Args", remoteArgs);
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        var job = await response.Content.ReadFromJsonAsync<RemoteJob>(cancellationToken);
+        return job ?? throw new InvalidOperationException("Android did not return a remote job.");
     }
 
     private static IReadOnlyList<string> BuildRemoteFfmpegArgs(ShimConfig config, FfmpegCommand command, MediaProbe probe)
@@ -534,270 +561,7 @@ public static class AndroidTranscode
 
 }
 
-public sealed class RemoteProcessHttpExchange : IAsyncDisposable
-{
-    private readonly TcpClient _client;
-    private readonly Task _uploadTask;
-
-    private RemoteProcessHttpExchange(TcpClient client, Stream responseBody, string boundary, Task uploadTask)
-    {
-        _client = client;
-        ResponseBody = responseBody;
-        Boundary = boundary;
-        _uploadTask = uploadTask;
-    }
-
-    public Stream ResponseBody { get; }
-    public string Boundary { get; }
-
-    public static async Task<RemoteProcessHttpExchange> Start(
-        Uri uri,
-        string token,
-        string remoteArgs,
-        Stream requestBody,
-        CancellationToken cancellationToken)
-    {
-        if (!string.Equals(uri.Scheme, "http", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new NotSupportedException("Remote process streaming currently supports http:// Android endpoints.");
-        }
-
-        var client = new TcpClient();
-        await client.ConnectAsync(uri.Host, uri.Port > 0 ? uri.Port : 80, cancellationToken);
-        var stream = client.GetStream();
-        var target = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
-        var headers = new StringBuilder()
-            .Append("POST ").Append(target).Append(" HTTP/1.1\r\n")
-            .Append("Host: ").Append(uri.Authority).Append("\r\n")
-            .Append("Authorization: Bearer ").Append(token).Append("\r\n")
-            .Append("X-Remote-Executable: ffmpeg\r\n")
-            .Append("X-Remote-Args: ").Append(remoteArgs).Append("\r\n")
-            .Append("Content-Type: application/octet-stream\r\n")
-            .Append("Transfer-Encoding: chunked\r\n")
-            .Append("Connection: close\r\n\r\n")
-            .ToString();
-        var headerBytes = Encoding.ASCII.GetBytes(headers);
-        await stream.WriteAsync(headerBytes, cancellationToken);
-        await stream.FlushAsync(cancellationToken);
-
-        var uploadTask = Task.Run(() => WriteChunkedBody(requestBody, stream, cancellationToken), cancellationToken);
-        var statusLine = await ReadAsciiLine(stream, cancellationToken)
-            ?? throw new IOException("Android closed the connection before sending response headers.");
-        var parts = statusLine.Split(' ', 3);
-        if (parts.Length < 2 || !int.TryParse(parts[1], out var statusCode))
-        {
-            throw new IOException("Invalid Android HTTP response: " + statusLine);
-        }
-
-        var responseHeaders = await ReadHeaders(stream, cancellationToken);
-        if (statusCode < 200 || statusCode >= 300)
-        {
-            var error = await ReadErrorBody(stream, responseHeaders, cancellationToken);
-            throw new HttpRequestException($"Android remote process returned {statusCode}: {error}");
-        }
-
-        var contentType = Header(responseHeaders, "content-type")
-            ?? throw new InvalidOperationException("Missing multipart content type");
-        Stream body = string.Equals(Header(responseHeaders, "transfer-encoding"), "chunked", StringComparison.OrdinalIgnoreCase)
-            ? new ChunkedResponseStream(stream)
-            : stream;
-        return new RemoteProcessHttpExchange(client, body, MultipartUtil.GetBoundary(contentType), uploadTask);
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        _client.Close();
-        try
-        {
-            await _uploadTask.WaitAsync(TimeSpan.FromSeconds(2));
-        }
-        catch
-        {
-        }
-        _client.Dispose();
-    }
-
-    private static async Task WriteChunkedBody(Stream input, Stream output, CancellationToken cancellationToken)
-    {
-        var buffer = new byte[64 * 1024];
-        while (true)
-        {
-            var read = await input.ReadAsync(buffer, cancellationToken);
-            if (read == 0)
-            {
-                break;
-            }
-            await output.WriteAsync(Encoding.ASCII.GetBytes(read.ToString("x", CultureInfo.InvariantCulture)), cancellationToken);
-            await output.WriteAsync("\r\n"u8.ToArray(), cancellationToken);
-            await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-            await output.WriteAsync("\r\n"u8.ToArray(), cancellationToken);
-            await output.FlushAsync(cancellationToken);
-        }
-        await output.WriteAsync("0\r\n\r\n"u8.ToArray(), cancellationToken);
-        await output.FlushAsync(cancellationToken);
-    }
-
-    private static async Task<Dictionary<string, string>> ReadHeaders(Stream stream, CancellationToken cancellationToken)
-    {
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        string? line;
-        while (!string.IsNullOrEmpty(line = await ReadAsciiLine(stream, cancellationToken)))
-        {
-            var colon = line.IndexOf(':');
-            if (colon > 0)
-            {
-                headers[line[..colon].Trim()] = line[(colon + 1)..].Trim();
-            }
-        }
-        return headers;
-    }
-
-    private static string? Header(Dictionary<string, string> headers, string name) =>
-        headers.TryGetValue(name, out var value) ? value : null;
-
-    private static async Task<string> ReadErrorBody(Stream stream, Dictionary<string, string> headers, CancellationToken cancellationToken)
-    {
-        using var bytes = new MemoryStream();
-        if (string.Equals(Header(headers, "transfer-encoding"), "chunked", StringComparison.OrdinalIgnoreCase))
-        {
-            await new ChunkedResponseStream(stream).CopyToAsync(bytes, cancellationToken);
-        }
-        else if (long.TryParse(Header(headers, "content-length"), out var length))
-        {
-            var buffer = new byte[Math.Min(length, 64 * 1024)];
-            long remaining = length;
-            while (remaining > 0)
-            {
-                var read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), cancellationToken);
-                if (read == 0)
-                {
-                    break;
-                }
-                bytes.Write(buffer, 0, read);
-                remaining -= read;
-            }
-        }
-        return Encoding.UTF8.GetString(bytes.ToArray());
-    }
-
-    private static async Task<string?> ReadAsciiLine(Stream stream, CancellationToken cancellationToken)
-    {
-        using var bytes = new MemoryStream();
-        var buffer = new byte[1];
-        while (true)
-        {
-            var read = await stream.ReadAsync(buffer, cancellationToken);
-            if (read == 0)
-            {
-                return bytes.Length == 0 ? null : Encoding.ASCII.GetString(bytes.ToArray());
-            }
-            if (buffer[0] == '\n')
-            {
-                var line = bytes.ToArray();
-                if (line.Length > 0 && line[^1] == '\r')
-                {
-                    line = line[..^1];
-                }
-                return Encoding.ASCII.GetString(line);
-            }
-            bytes.WriteByte(buffer[0]);
-        }
-    }
-}
-
-public sealed class ChunkedResponseStream : Stream
-{
-    private readonly Stream _inner;
-    private int _remainingInChunk;
-    private bool _finished;
-
-    public ChunkedResponseStream(Stream inner)
-    {
-        _inner = inner;
-    }
-
-    public override bool CanRead => true;
-    public override bool CanSeek => false;
-    public override bool CanWrite => false;
-    public override long Length => throw new NotSupportedException();
-    public override long Position
-    {
-        get => throw new NotSupportedException();
-        set => throw new NotSupportedException();
-    }
-
-    public override void Flush() => throw new NotSupportedException();
-
-    public override int Read(byte[] buffer, int offset, int count) =>
-        ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
-
-    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-    {
-        if (_finished)
-        {
-            return 0;
-        }
-        if (_remainingInChunk == 0)
-        {
-            var line = await ReadAsciiLine(cancellationToken);
-            if (line is null)
-            {
-                return 0;
-            }
-            var semicolon = line.IndexOf(';');
-            var sizeText = semicolon >= 0 ? line[..semicolon] : line;
-            _remainingInChunk = int.Parse(sizeText, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
-            if (_remainingInChunk == 0)
-            {
-                while (!string.IsNullOrEmpty(await ReadAsciiLine(cancellationToken)))
-                {
-                }
-                _finished = true;
-                return 0;
-            }
-        }
-
-        var read = await _inner.ReadAsync(buffer[..Math.Min(buffer.Length, _remainingInChunk)], cancellationToken);
-        if (read == 0)
-        {
-            return 0;
-        }
-        _remainingInChunk -= read;
-        if (_remainingInChunk == 0)
-        {
-            await ReadAsciiLine(cancellationToken);
-        }
-        return read;
-    }
-
-    private async Task<string?> ReadAsciiLine(CancellationToken cancellationToken)
-    {
-        using var bytes = new MemoryStream();
-        var buffer = new byte[1];
-        while (true)
-        {
-            var read = await _inner.ReadAsync(buffer, cancellationToken);
-            if (read == 0)
-            {
-                return bytes.Length == 0 ? null : Encoding.ASCII.GetString(bytes.ToArray());
-            }
-            if (buffer[0] == '\n')
-            {
-                var line = bytes.ToArray();
-                if (line.Length > 0 && line[^1] == '\r')
-                {
-                    line = line[..^1];
-                }
-                return Encoding.ASCII.GetString(line);
-            }
-            bytes.WriteByte(buffer[0]);
-        }
-    }
-
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-}
+public sealed record RemoteJob(string Id, string StdinUrl, string FilesUrl);
 
 public sealed class RateLimitedReadStream : Stream
 {

@@ -503,52 +503,87 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
                     continue;
                 }
 
-                var request = new AndroidRequest(
-                    context.Request.Url?.AbsolutePath ?? "",
-                    context.Request.Headers["Authorization"] ?? "",
-                    context.Request.ContentType ?? "",
-                    context.Request.Headers["X-Remote-Executable"] ?? "",
-                    DecodeArgs(context.Request.Headers["X-Remote-Args"] ?? ""),
-                    ParseQuery(context.Request.Url?.Query ?? ""),
-                    0,
-                    []);
-                lock (_requests)
+                var path = context.Request.Url?.AbsolutePath ?? "";
+                if (path == "/api/v1/remoteprocesses" && context.Request.HttpMethod == "POST")
                 {
-                    _requests.Add(request);
-                }
+                    var request = new AndroidRequest(
+                        path,
+                        context.Request.Headers["Authorization"] ?? "",
+                        context.Request.ContentType ?? "",
+                        context.Request.Headers["X-Remote-Executable"] ?? "",
+                        DecodeArgs(context.Request.Headers["X-Remote-Args"] ?? ""),
+                        ParseQuery(context.Request.Url?.Query ?? ""),
+                        0,
+                        []);
+                    lock (_requests)
+                    {
+                        _requests.Add(request);
+                    }
 
-                var requestIndex = RequestCount - 1;
-                if (_failFirstRemoteRequest && requestIndex == 0)
-                {
-                    var buffer = new byte[8192];
-                    _ = await context.Request.InputStream.ReadAsync(buffer);
-                    context.Response.StatusCode = 503;
-                    var body = "remote process closed while upload was active\n"u8.ToArray();
-                    context.Response.ContentType = "text/plain";
+                    var requestIndex = RequestCount - 1;
+                    if (_failFirstRemoteRequest && requestIndex == 0)
+                    {
+                        context.Response.StatusCode = 503;
+                        var failure = "remote process failed before start\n"u8.ToArray();
+                        context.Response.ContentType = "text/plain";
+                        context.Response.ContentLength64 = failure.Length;
+                        await context.Response.OutputStream.WriteAsync(failure);
+                        context.Response.Close();
+                        continue;
+                    }
+
+                    var body = Encoding.UTF8.GetBytes("""{"id":"job-1","stdinUrl":"/api/v1/remoteprocesses/job-1/stdin","filesUrl":"/api/v1/remoteprocesses/job-1/files"}""");
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "application/json";
                     context.Response.ContentLength64 = body.Length;
                     await context.Response.OutputStream.WriteAsync(body);
                     context.Response.Close();
                     continue;
                 }
 
-                var drainTask = DrainRequest(context.Request.InputStream, requestIndex);
-                context.Response.StatusCode = 200;
-                var boundary = "test-boundary";
-                context.Response.ContentType = "multipart/mixed; boundary=" + boundary;
-                context.Response.SendChunked = true;
-                foreach (var file in _files)
+                if (path == "/api/v1/remoteprocesses/job-1/stdin" && context.Request.HttpMethod == "PUT")
                 {
-                    var partHeaders = Encoding.ASCII.GetBytes(
-                        $"--{boundary}\r\nContent-Type: application/octet-stream\r\nX-Remote-Event: upsert\r\nX-Remote-Path: {file.Key}\r\nContent-Length: {file.Value.Length}\r\n\r\n");
-                    await context.Response.OutputStream.WriteAsync(partHeaders);
-                    await context.Response.OutputStream.WriteAsync(file.Value);
-                    await context.Response.OutputStream.WriteAsync("\r\n"u8.ToArray());
-                    await context.Response.OutputStream.FlushAsync();
-                    await Task.Delay(10);
+                    lock (_requests)
+                    {
+                        if (_requests.Count > 0)
+                        {
+                            var request = _requests[^1];
+                            _requests[^1] = request with { ContentType = context.Request.ContentType ?? "" };
+                        }
+                    }
+                    await DrainRequest(context.Request.InputStream, Math.Max(0, RequestCount - 1));
+                    var body = "{}"u8.ToArray();
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "application/json";
+                    context.Response.ContentLength64 = body.Length;
+                    await context.Response.OutputStream.WriteAsync(body);
+                    context.Response.Close();
+                    continue;
                 }
-                var exit = Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\nContent-Length: 14\r\n\r\n{{\"exitCode\":0}}\r\n--{boundary}--\r\n");
-                await context.Response.OutputStream.WriteAsync(exit);
-                await drainTask;
+
+                if (path == "/api/v1/remoteprocesses/job-1/files" && context.Request.HttpMethod == "GET")
+                {
+                    context.Response.StatusCode = 200;
+                    var boundary = "test-boundary";
+                    context.Response.ContentType = "multipart/mixed; boundary=" + boundary;
+                    context.Response.SendChunked = true;
+                    foreach (var file in _files)
+                    {
+                        var partHeaders = Encoding.ASCII.GetBytes(
+                            $"--{boundary}\r\nContent-Type: application/octet-stream\r\nX-Remote-Event: upsert\r\nX-Remote-Path: {file.Key}\r\nContent-Length: {file.Value.Length}\r\n\r\n");
+                        await context.Response.OutputStream.WriteAsync(partHeaders);
+                        await context.Response.OutputStream.WriteAsync(file.Value);
+                        await context.Response.OutputStream.WriteAsync("\r\n"u8.ToArray());
+                        await context.Response.OutputStream.FlushAsync();
+                        await Task.Delay(10);
+                    }
+                    var exit = Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\nContent-Length: 14\r\n\r\n{{\"exitCode\":0}}\r\n--{boundary}--\r\n");
+                    await context.Response.OutputStream.WriteAsync(exit);
+                    context.Response.Close();
+                    continue;
+                }
+
+                context.Response.StatusCode = 404;
                 context.Response.Close();
             }
         }

@@ -202,6 +202,14 @@ public class TranscoderService extends Service {
                 remoteProcess(request, in, out);
                 return;
             }
+            if (request.path.startsWith("/api/v1/remoteprocesses/") && request.path.endsWith("/stdin") && request.method.equals("PUT")) {
+                remoteProcessStdin(request, in, out);
+                return;
+            }
+            if (request.path.startsWith("/api/v1/remoteprocesses/") && request.path.endsWith("/files") && request.method.equals("GET")) {
+                remoteProcessFiles(request, out);
+                return;
+            }
             writeText(out, 404, "not found\n");
         } catch (Exception ex) {
             Log.e(TAG, "Request failed", ex);
@@ -253,6 +261,10 @@ public class TranscoderService extends Service {
     }
 
     private void remoteProcess(Request request, InputStream requestBody, OutputStream response) throws Exception {
+        if ("1".equals(request.headers.get("x-remote-split"))) {
+            startRemoteProcess(request, response);
+            return;
+        }
         reapStaleJob("new request");
         JobState job = new JobState(UUID.randomUUID().toString(), new File(getCacheDir(), "remoteprocesses/" + UUID.randomUUID()));
         if (!CURRENT_JOB.compareAndSet(null, job)) {
@@ -302,6 +314,99 @@ public class TranscoderService extends Service {
             CURRENT_JOB.compareAndSet(job, null);
             ACTIVE_JOBS.set(0);
         }
+    }
+
+    private void startRemoteProcess(Request request, OutputStream response) throws Exception {
+        reapStaleJob("new split request");
+        JobState job = new JobState(UUID.randomUUID().toString(), new File(getCacheDir(), "remoteprocesses/" + UUID.randomUUID()));
+        if (!CURRENT_JOB.compareAndSet(null, job)) {
+            writeText(response, 429, "busy\n");
+            return;
+        }
+        ACTIVE_JOBS.set(1);
+        try {
+            ACCEPTED_JOBS.incrementAndGet();
+            File outputDir = new File(job.workDir, "out");
+            if (!outputDir.mkdirs() && !outputDir.isDirectory()) {
+                throw new IOException("Failed to create " + outputDir);
+            }
+            job.outputDir = outputDir;
+            List<String> command = remoteProcessCommand(request, outputDir);
+            Process process = new ProcessBuilder(command).redirectErrorStream(false).start();
+            job.setProcess(process);
+            Thread stdout = new Thread(() -> drainStream(process.getInputStream()), "remoteprocess-stdout");
+            Thread stderr = new Thread(() -> logStream(process.getErrorStream(), job.stderrText), "remoteprocess-stderr");
+            stdout.setDaemon(true);
+            stderr.setDaemon(true);
+            stdout.start();
+            stderr.start();
+            JSONObject body = new JSONObject()
+                    .put("id", job.id)
+                    .put("stdinUrl", "/api/v1/remoteprocesses/" + job.id + "/stdin")
+                    .put("filesUrl", "/api/v1/remoteprocesses/" + job.id + "/files");
+            writeJson(response, body);
+        } catch (Exception ex) {
+            LAST_JOB_JSON.set(job.toJson(-1, ex.getClass().getSimpleName() + ": " + ex.getMessage(), job.stderrText.toString()).toString());
+            deleteRecursively(job.workDir);
+            CURRENT_JOB.compareAndSet(job, null);
+            ACTIVE_JOBS.set(0);
+            throw ex;
+        }
+    }
+
+    private void remoteProcessStdin(Request request, InputStream requestBody, OutputStream response) throws Exception {
+        JobState job = jobFromPath(request.path, "/stdin");
+        if (job == null || job.process == null) {
+            writeText(response, 404, "job not found\n");
+            return;
+        }
+        try (OutputStream stdin = job.process.getOutputStream()) {
+            if ("chunked".equals(request.headers.get("transfer-encoding"))) {
+                copyChunkedRequest(job, requestBody, stdin);
+            } else {
+                long length = Long.parseLong(request.headers.getOrDefault("content-length", "0"));
+                copyFixed(job, requestBody, stdin, length);
+            }
+        }
+        writeJson(response, new JSONObject().put("id", job.id).put("inputBytes", job.inputBytes.get()));
+    }
+
+    private void remoteProcessFiles(Request request, OutputStream response) throws Exception {
+        JobState job = jobFromPath(request.path, "/files");
+        if (job == null || job.process == null || job.outputDir == null) {
+            writeText(response, 404, "job not found\n");
+            return;
+        }
+        int exit = -1;
+        String failure = "";
+        try {
+            exit = streamMultipartFiles(response, job.outputDir, job.process, job.stderrText, job);
+            if (exit == 0) {
+                COMPLETED_JOBS.incrementAndGet();
+            }
+        } catch (Exception ex) {
+            failure = ex.getClass().getSimpleName() + ": " + ex.getMessage();
+            throw ex;
+        } finally {
+            LAST_JOB_JSON.set(job.toJson(exit, failure, job.stderrText.toString()).toString());
+            Process process = job.process;
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            deleteRecursively(job.workDir);
+            CURRENT_JOB.compareAndSet(job, null);
+            ACTIVE_JOBS.set(0);
+        }
+    }
+
+    private JobState jobFromPath(String path, String suffix) {
+        String prefix = "/api/v1/remoteprocesses/";
+        if (!path.startsWith(prefix) || !path.endsWith(suffix)) {
+            return null;
+        }
+        String id = path.substring(prefix.length(), path.length() - suffix.length());
+        JobState job = CURRENT_JOB.get();
+        return job != null && job.id.equals(id) ? job : null;
     }
 
     private List<String> remoteProcessCommand(Request request, File outputDir) throws Exception {
@@ -605,6 +710,8 @@ public class TranscoderService extends Service {
         volatile long lastActivityMillis;
         volatile String cancelReason = "";
         volatile Process process;
+        volatile File outputDir;
+        final StringBuffer stderrText = new StringBuffer();
 
         JobState(String id, File workDir) {
             this.id = id;
