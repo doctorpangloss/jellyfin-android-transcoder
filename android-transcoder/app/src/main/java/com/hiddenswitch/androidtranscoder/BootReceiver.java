@@ -17,10 +17,14 @@ public final class BootReceiver extends BroadcastReceiver {
 
         Log.i(TAG, "Starting service after boot");
         Intent service = new Intent(context, TranscoderService.class);
-        if (Build.VERSION.SDK_INT >= 26) {
-            context.startForegroundService(service);
-        } else {
-            context.startService(service);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(service);
+            } else {
+                context.startService(service);
+            }
+        } catch (RuntimeException ex) {
+            Log.w(TAG, "Android blocked boot-time service start; open the app once to start it", ex);
         }
     }
 }

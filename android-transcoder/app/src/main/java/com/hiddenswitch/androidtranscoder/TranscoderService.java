@@ -11,21 +11,24 @@ import android.os.IBinder;
 import android.os.PowerManager;
 import android.util.Log;
 
+import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.http.HttpServerResponse;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
+
 import org.json.JSONObject;
 import org.json.JSONArray;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -33,7 +36,6 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.HashSet;
@@ -60,8 +62,8 @@ public class TranscoderService extends Service {
     private static volatile boolean running;
 
     private ExecutorService executor;
-    private ServerSocket server;
-    private Thread acceptThread;
+    private Vertx vertx;
+    private HttpServer httpServer;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
 
@@ -106,11 +108,11 @@ public class TranscoderService extends Service {
     @Override
     public void onDestroy() {
         running = false;
-        try {
-            if (server != null) {
-                server.close();
-            }
-        } catch (IOException ignored) {
+        if (httpServer != null) {
+            httpServer.close();
+        }
+        if (vertx != null) {
+            vertx.close();
         }
         if (executor != null) {
             executor.shutdownNow();
@@ -125,19 +127,25 @@ public class TranscoderService extends Service {
     }
 
     private void startServer() {
-        acceptThread = new Thread(() -> {
-            try {
-                server = new ServerSocket(AppConfig.PORT);
-                Log.i(TAG, "Listening on " + AppConfig.PORT);
-                while (!Thread.currentThread().isInterrupted()) {
-                    Socket socket = server.accept();
-                    executor.submit(() -> handle(socket));
-                }
-            } catch (IOException ex) {
-                Log.e(TAG, "Server failed", ex);
-            }
-        }, "android-transcoder-http");
-        acceptThread.start();
+        vertx = Vertx.vertx();
+        Router router = Router.router(vertx);
+
+        router.get("/api/v1/status").handler(this::handleStatus);
+        router.route("/api/v1/*").handler(this::requireAuthorization);
+        router.delete("/api/v1/remoteprocesses/current").handler(this::handleCancelCurrentJob);
+        router.post("/api/v1/remoteprocesses").handler(this::handleRemoteProcess);
+        router.putWithRegex("/api/v1/remoteprocesses/[^/]+/stdin").handler(this::handleRemoteProcessStdin);
+        router.getWithRegex("/api/v1/remoteprocesses/[^/]+/files").handler(this::handleRemoteProcessFiles);
+        router.route().handler(ctx -> ctx.response().setStatusCode(404).end("not found\n"));
+
+        httpServer = vertx.createHttpServer().requestHandler(router);
+        httpServer.listen(AppConfig.PORT).onComplete(result -> {
+                    if (result.succeeded()) {
+                        Log.i(TAG, "Vert.x Web listening on " + AppConfig.PORT);
+                    } else {
+                        Log.e(TAG, "Vert.x Web server failed", result.cause());
+                    }
+                });
     }
 
     private void updatePowerLocks() {
@@ -177,53 +185,60 @@ public class TranscoderService extends Service {
         }
     }
 
-    private void handle(Socket socket) {
+    private void handleStatus(RoutingContext ctx) {
         try {
-            socket.setSoTimeout(120000);
-            BufferedInputStream in = new BufferedInputStream(socket.getInputStream());
-            BufferedOutputStream out = new BufferedOutputStream(socket.getOutputStream());
-            Request request = Request.read(in);
-            if (request == null) {
-                return;
-            }
-            if (request.path.equals("/api/v1/status") && request.method.equals("GET")) {
-                writeJson(out, statusJson());
-                return;
-            }
-            if (!authorized(request)) {
-                writeText(out, 401, "unauthorized\n");
-                return;
-            }
-            if (request.path.equals("/api/v1/remoteprocesses/current") && request.method.equals("DELETE")) {
-                cancelCurrentJob(out);
-                return;
-            }
-            if (request.path.equals("/api/v1/remoteprocesses") && request.method.equals("POST")) {
-                remoteProcess(request, in, out);
-                return;
-            }
-            if (request.path.startsWith("/api/v1/remoteprocesses/") && request.path.endsWith("/stdin") && request.method.equals("PUT")) {
-                remoteProcessStdin(request, in, out);
-                return;
-            }
-            if (request.path.startsWith("/api/v1/remoteprocesses/") && request.path.endsWith("/files") && request.method.equals("GET")) {
-                remoteProcessFiles(request, out);
-                return;
-            }
-            writeText(out, 404, "not found\n");
+            writeJson(ctx.response(), statusJson());
         } catch (Exception ex) {
-            Log.e(TAG, "Request failed", ex);
-        } finally {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-            }
+            fail(ctx, ex);
         }
     }
 
-    private boolean authorized(Request request) {
-        String auth = request.headers.get("authorization");
-        return auth != null && auth.equals("Bearer " + AppConfig.token(this));
+    private void requireAuthorization(RoutingContext ctx) {
+        String auth = ctx.request().getHeader("authorization");
+        if (auth == null || !auth.equals("Bearer " + AppConfig.token(this))) {
+            writeText(ctx.response(), 401, "unauthorized\n");
+            return;
+        }
+        ctx.next();
+    }
+
+    private void handleCancelCurrentJob(RoutingContext ctx) {
+        try {
+            cancelCurrentJob(ctx.response());
+        } catch (Exception ex) {
+            fail(ctx, ex);
+        }
+    }
+
+    private void handleRemoteProcess(RoutingContext ctx) {
+        try {
+            startRemoteProcess(Request.from(ctx), ctx.response());
+        } catch (Exception ex) {
+            fail(ctx, ex);
+        }
+    }
+
+    private void handleRemoteProcessStdin(RoutingContext ctx) {
+        try {
+            streamRequestToProcessStdin(Request.from(ctx), ctx);
+        } catch (Exception ex) {
+            fail(ctx, ex);
+        }
+    }
+
+    private void handleRemoteProcessFiles(RoutingContext ctx) {
+        try {
+            streamRemoteProcessFiles(Request.from(ctx), ctx.response());
+        } catch (Exception ex) {
+            fail(ctx, ex);
+        }
+    }
+
+    private void fail(RoutingContext ctx, Exception ex) {
+        Log.e(TAG, "Request failed", ex);
+        if (!ctx.response().ended()) {
+            writeText(ctx.response(), 500, "error\n");
+        }
     }
 
     private JSONObject statusJson() throws Exception {
@@ -260,63 +275,8 @@ public class TranscoderService extends Service {
         return obj;
     }
 
-    private void remoteProcess(Request request, InputStream requestBody, OutputStream response) throws Exception {
-        if ("1".equals(request.headers.get("x-remote-split"))) {
-            startRemoteProcess(request, response);
-            return;
-        }
+    private void startRemoteProcess(Request request, HttpServerResponse response) throws Exception {
         reapStaleJob("new request");
-        JobState job = new JobState(UUID.randomUUID().toString(), new File(getCacheDir(), "remoteprocesses/" + UUID.randomUUID()));
-        if (!CURRENT_JOB.compareAndSet(null, job)) {
-            writeText(response, 429, "busy\n");
-            return;
-        }
-        ACTIVE_JOBS.set(1);
-        Process process = null;
-        int exit = -1;
-        String failure = "";
-        try {
-            ACCEPTED_JOBS.incrementAndGet();
-            File outputDir = new File(job.workDir, "out");
-            if (!outputDir.mkdirs() && !outputDir.isDirectory()) {
-                throw new IOException("Failed to create " + outputDir);
-            }
-            List<String> command = remoteProcessCommand(request, outputDir);
-            process = new ProcessBuilder(command).redirectErrorStream(false).start();
-            job.setProcess(process);
-            Process child = process;
-            Thread stdin = new Thread(() -> pipeRequestBody(job, request, requestBody, child), "remoteprocess-stdin");
-            Thread stdout = new Thread(() -> logStream(child.getInputStream(), job.stdoutText, false), "remoteprocess-stdout");
-            Thread stderr = new Thread(() -> logStream(child.getErrorStream(), job.stderrText, true), "remoteprocess-stderr");
-            stdin.setDaemon(true);
-            stdout.setDaemon(true);
-            stderr.setDaemon(true);
-            stdin.start();
-            stdout.start();
-            stderr.start();
-
-            exit = streamMultipartFiles(response, outputDir, child, job.stdoutText, job.stderrText, job);
-            stdout.join(2000);
-            stderr.join(2000);
-            if (exit == 0) {
-                COMPLETED_JOBS.incrementAndGet();
-            }
-        } catch (Exception ex) {
-            failure = ex.getClass().getSimpleName() + ": " + ex.getMessage();
-            throw ex;
-        } finally {
-            if (process != null) {
-                process.destroyForcibly();
-            }
-            LAST_JOB_JSON.set(job.toJson(exit, failure).toString());
-            deleteRecursively(job.workDir);
-            CURRENT_JOB.compareAndSet(job, null);
-            ACTIVE_JOBS.set(0);
-        }
-    }
-
-    private void startRemoteProcess(Request request, OutputStream response) throws Exception {
-        reapStaleJob("new split request");
         JobState job = new JobState(UUID.randomUUID().toString(), new File(getCacheDir(), "remoteprocesses/" + UUID.randomUUID()));
         if (!CURRENT_JOB.compareAndSet(null, job)) {
             writeText(response, 429, "busy\n");
@@ -331,71 +291,134 @@ public class TranscoderService extends Service {
             }
             job.outputDir = outputDir;
             List<String> command = remoteProcessCommand(request, outputDir);
-            Process process = new ProcessBuilder(command).redirectErrorStream(false).start();
+            Process process = new ProcessBuilder(command).start();
             job.setProcess(process);
-            Thread stdout = new Thread(() -> logStream(process.getInputStream(), job.stdoutText, false), "remoteprocess-stdout");
-            Thread stderr = new Thread(() -> logStream(process.getErrorStream(), job.stderrText, true), "remoteprocess-stderr");
-            stdout.setDaemon(true);
-            stderr.setDaemon(true);
-            stdout.start();
-            stderr.start();
+            executor.execute(() -> drainProcessOutput(job, process.getInputStream(), false));
+            executor.execute(() -> drainProcessOutput(job, process.getErrorStream(), true));
+            executor.execute(() -> waitForProcess(job, process));
             JSONObject body = new JSONObject()
                     .put("id", job.id)
                     .put("stdinUrl", "/api/v1/remoteprocesses/" + job.id + "/stdin")
                     .put("filesUrl", "/api/v1/remoteprocesses/" + job.id + "/files");
             writeJson(response, body);
         } catch (Exception ex) {
-            LAST_JOB_JSON.set(job.toJson(-1, ex.getClass().getSimpleName() + ": " + ex.getMessage()).toString());
-            deleteRecursively(job.workDir);
-            CURRENT_JOB.compareAndSet(job, null);
-            ACTIVE_JOBS.set(0);
-            throw ex;
+            failStart(job, response, ex);
         }
     }
 
-    private void remoteProcessStdin(Request request, InputStream requestBody, OutputStream response) throws Exception {
+    private void failStart(JobState job, HttpServerResponse response, Throwable ex) {
+        try {
+            LAST_JOB_JSON.set(job.toJson(-1, ex.getClass().getSimpleName() + ": " + ex.getMessage()).toString());
+        } catch (Exception ignored) {
+        }
+        deleteRecursively(job.workDir);
+        CURRENT_JOB.compareAndSet(job, null);
+        ACTIVE_JOBS.set(0);
+        if (!response.ended()) {
+            writeText(response, 500, "error\n");
+        }
+    }
+
+    private void streamRequestToProcessStdin(Request request, RoutingContext ctx) {
         JobState job = jobFromPath(request.path, "/stdin");
         if (job == null || job.process == null) {
-            writeText(response, 404, "job not found\n");
+            writeText(ctx.response(), 404, "job not found\n");
             return;
         }
-        try (OutputStream stdin = job.process.getOutputStream()) {
-            if ("chunked".equals(request.headers.get("transfer-encoding"))) {
-                copyChunkedRequest(job, requestBody, stdin);
-            } else {
-                long length = Long.parseLong(request.headers.getOrDefault("content-length", "0"));
-                copyFixed(job, requestBody, stdin, length);
+        HttpServerRequest httpRequest = ctx.request();
+        OutputStream stdin = job.process.getOutputStream();
+        httpRequest.handler(buffer -> {
+            httpRequest.pause();
+            byte[] bytes = buffer.getBytes();
+            job.stdinExecutor.execute(() -> {
+                try {
+                    stdin.write(bytes);
+                    stdin.flush();
+                    INPUT_BYTES.addAndGet(bytes.length);
+                    job.addInputBytes(bytes.length);
+                    vertx.runOnContext(ignored -> httpRequest.resume());
+                } catch (IOException ex) {
+                    job.cancel("stdin-error");
+                    vertx.runOnContext(ignored -> {
+                        if (!ctx.response().ended()) {
+                            writeText(ctx.response(), 500, "stdin error\n");
+                        }
+                    });
+                }
+            });
+        });
+        httpRequest.exceptionHandler(ex -> {
+            job.cancel("stdin-error");
+            if (!ctx.response().ended()) {
+                writeText(ctx.response(), 500, "stdin error\n");
             }
-        }
-        writeJson(response, new JSONObject().put("id", job.id).put("inputBytes", job.inputBytes.get()));
+        });
+        httpRequest.endHandler(ignored -> job.stdinExecutor.execute(() -> {
+            try {
+                stdin.close();
+                vertx.runOnContext(done -> {
+                    if (!ctx.response().ended()) {
+                        try {
+                            writeJson(ctx.response(), new JSONObject().put("id", job.id).put("inputBytes", job.inputBytes.get()));
+                        } catch (Exception ex) {
+                            writeText(ctx.response(), 500, "error\n");
+                        }
+                    }
+                });
+            } catch (IOException ex) {
+                job.cancel("stdin-close-error");
+                vertx.runOnContext(done -> {
+                    if (!ctx.response().ended()) {
+                        writeText(ctx.response(), 500, "stdin close error\n");
+                    }
+                });
+            }
+        }));
+        httpRequest.resume();
     }
 
-    private void remoteProcessFiles(Request request, OutputStream response) throws Exception {
+    private void drainProcessOutput(JobState job, InputStream input, boolean stderr) {
+        byte[] bytes = new byte[8192];
+        try {
+            int read;
+            while ((read = input.read(bytes)) >= 0) {
+                appendProcessOutput(job, bytes, read, stderr);
+            }
+        } catch (IOException ex) {
+            appendProcessText(job.stderrText, "process output read failed: " + ex + "\n", true);
+        }
+    }
+
+    private void waitForProcess(JobState job, Process process) {
+        try {
+            int code = process.waitFor();
+            job.exitCode = code;
+            if (code == 0) {
+                COMPLETED_JOBS.incrementAndGet();
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            job.cancelReason = "wait-interrupted";
+        } finally {
+            job.processExited = true;
+            job.stdinExecutor.shutdown();
+            job.touchOutput();
+        }
+    }
+
+    private void streamRemoteProcessFiles(Request request, HttpServerResponse response) throws Exception {
         JobState job = jobFromPath(request.path, "/files");
         if (job == null || job.process == null || job.outputDir == null) {
             writeText(response, 404, "job not found\n");
             return;
         }
-        int exit = -1;
-        String failure = "";
-        try {
-            exit = streamMultipartFiles(response, job.outputDir, job.process, job.stdoutText, job.stderrText, job);
-            if (exit == 0) {
-                COMPLETED_JOBS.incrementAndGet();
-            }
-        } catch (Exception ex) {
-            failure = ex.getClass().getSimpleName() + ": " + ex.getMessage();
-            throw ex;
-        } finally {
-            LAST_JOB_JSON.set(job.toJson(exit, failure).toString());
-            Process process = job.process;
-            if (process != null) {
-                process.destroyForcibly();
-            }
-            deleteRecursively(job.workDir);
-            CURRENT_JOB.compareAndSet(job, null);
-            ACTIVE_JOBS.set(0);
-        }
+        String boundary = "jfat-" + UUID.randomUUID();
+        response.setStatusCode(200)
+                .putHeader("Content-Type", "multipart/mixed; boundary=" + boundary)
+                .setChunked(true);
+        Map<String, FileSnapshot> observed = new HashMap<>();
+        Set<String> sent = new HashSet<>();
+        streamMultipartTick(response, boundary, observed, sent, job, 0);
     }
 
     private JobState jobFromPath(String path, String suffix) {
@@ -457,56 +480,23 @@ public class TranscoderService extends Service {
         }
     }
 
-    private void pipeRequestBody(JobState job, Request request, InputStream in, Process process) {
-        try (OutputStream stdin = process.getOutputStream()) {
-            if ("chunked".equals(request.headers.get("transfer-encoding"))) {
-                copyChunkedRequest(job, in, stdin);
-            } else {
-                long length = Long.parseLong(request.headers.getOrDefault("content-length", "0"));
-                copyFixed(job, in, stdin, length);
-            }
-        } catch (Exception ignored) {
-        }
+    private static void writeJson(HttpServerResponse response, JSONObject json) {
+        writeJson(response, 200, json);
     }
 
-    private static void writeJson(OutputStream out, JSONObject json) throws IOException {
-        writeJson(out, 200, json);
+    private static void writeJson(HttpServerResponse response, int status, JSONObject json) {
+        response.setStatusCode(status)
+                .putHeader("Content-Type", "application/json")
+                .end(json.toString() + "\n");
     }
 
-    private static void writeJson(OutputStream out, int status, JSONObject json) throws IOException {
-        byte[] body = (json.toString() + "\n").getBytes(StandardCharsets.UTF_8);
-        writeHeaders(out, status, "application/json", false, body.length);
-        out.write(body);
-        out.flush();
+    private static void writeText(HttpServerResponse response, int status, String bodyText) {
+        response.setStatusCode(status)
+                .putHeader("Content-Type", "text/plain")
+                .end(bodyText);
     }
 
-    private static void writeText(OutputStream out, int status, String bodyText) throws IOException {
-        byte[] body = bodyText.getBytes(StandardCharsets.UTF_8);
-        writeHeaders(out, status, "text/plain", false, body.length);
-        out.write(body);
-        out.flush();
-    }
-
-    private static void writeHeaders(OutputStream out, int status, String contentType, boolean chunked) throws IOException {
-        writeHeaders(out, status, contentType, chunked, -1);
-    }
-
-    private static void writeHeaders(OutputStream out, int status, String contentType, boolean chunked, long length) throws IOException {
-        String reason = status == 200 ? "OK" : status == 401 ? "Unauthorized" : status == 429 ? "Too Many Requests" : "Error";
-        StringBuilder headers = new StringBuilder();
-        headers.append("HTTP/1.1 ").append(status).append(' ').append(reason).append("\r\n");
-        headers.append("Content-Type: ").append(contentType).append("\r\n");
-        if (chunked) {
-            headers.append("Transfer-Encoding: chunked\r\n");
-        } else {
-            headers.append("Content-Length: ").append(length).append("\r\n");
-        }
-        headers.append("Connection: close\r\n\r\n");
-        out.write(headers.toString().getBytes(StandardCharsets.US_ASCII));
-        out.flush();
-    }
-
-    private void cancelCurrentJob(OutputStream out) throws Exception {
+    private void cancelCurrentJob(HttpServerResponse out) throws Exception {
         JobState job = CURRENT_JOB.get();
         JSONObject response = new JSONObject();
         if (job == null) {
@@ -521,30 +511,39 @@ public class TranscoderService extends Service {
         writeJson(out, response);
     }
 
-    private static int streamMultipartFiles(OutputStream out, File outputDir, Process process, StringBuffer stdoutText, StringBuffer stderrText, JobState job) throws IOException, InterruptedException {
-        String boundary = "jfat-" + UUID.randomUUID();
-        writeHeaders(out, 200, "multipart/mixed; boundary=" + boundary, true);
-        Map<String, FileSnapshot> observed = new HashMap<>();
-        Set<String> sent = new HashSet<>();
-        while (process.isAlive()) {
-            enforceLiveness(job, process);
-            streamStableFiles(out, outputDir, boundary, observed, sent, job);
-            Thread.sleep(100);
+    private void streamMultipartTick(HttpServerResponse out, String boundary, Map<String, FileSnapshot> observed, Set<String> sent, JobState job, int finalFlushes) {
+        try {
+            enforceLiveness(job);
+            streamStableFiles(out, job.outputDir, boundary, observed, sent, job);
+            if (job.processExited) {
+                if (finalFlushes >= 5) {
+                    writeExitPart(out, boundary, job.exitCode, job.stdoutText.toString(), job.stderrText.toString());
+                    LAST_JOB_JSON.set(job.toJson(job.exitCode, "").toString());
+                    deleteRecursively(job.workDir);
+                    CURRENT_JOB.compareAndSet(job, null);
+                    ACTIVE_JOBS.set(0);
+                    return;
+                }
+                vertx.setTimer(100, ignored -> streamMultipartTick(out, boundary, observed, sent, job, finalFlushes + 1));
+                return;
+            }
+            vertx.setTimer(100, ignored -> streamMultipartTick(out, boundary, observed, sent, job, 0));
+        } catch (Exception ex) {
+            try {
+                LAST_JOB_JSON.set(job.toJson(job.exitCode, ex.getClass().getSimpleName() + ": " + ex.getMessage()).toString());
+            } catch (Exception ignored) {
+            }
+            job.cancel("files-error");
+            deleteRecursively(job.workDir);
+            CURRENT_JOB.compareAndSet(job, null);
+            ACTIVE_JOBS.set(0);
+            if (!out.ended()) {
+                out.end();
+            }
         }
-        if (!process.waitFor(120, TimeUnit.SECONDS)) {
-            process.destroyForcibly();
-            throw new IOException("remote process timed out");
-        }
-        int exitCode = process.exitValue();
-        for (int i = 0; i < 5; i++) {
-            streamStableFiles(out, outputDir, boundary, observed, sent, job);
-            Thread.sleep(100);
-        }
-        writeExitPart(out, boundary, exitCode, stdoutText.toString(), stderrText.toString());
-        return exitCode;
     }
 
-    private static void enforceLiveness(JobState job, Process process) throws IOException {
+    private static void enforceLiveness(JobState job) throws IOException {
         long age = job.ageMillis();
         long idle = job.idleMillis();
         if (age > JOB_MAX_RUNTIME_MS) {
@@ -555,9 +554,6 @@ public class TranscoderService extends Service {
             job.cancel("idle-timeout");
             throw new IOException("remote process idle timeout");
         }
-        if (!process.isAlive()) {
-            job.touchOutput();
-        }
     }
 
     private void reapStaleJob(String reason) {
@@ -566,7 +562,7 @@ public class TranscoderService extends Service {
             return;
         }
         Process process = job.process;
-        if ((process != null && !process.isAlive()) || job.ageMillis() > JOB_MAX_RUNTIME_MS || job.idleMillis() > JOB_IDLE_TIMEOUT_MS) {
+        if ((process != null && job.processExited) || job.ageMillis() > JOB_MAX_RUNTIME_MS || job.idleMillis() > JOB_IDLE_TIMEOUT_MS) {
             Log.w(TAG, "Reaping stale remote process " + job.id + " during " + reason);
             job.cancel("reaped-" + reason);
             if (CURRENT_JOB.compareAndSet(job, null)) {
@@ -576,7 +572,7 @@ public class TranscoderService extends Service {
         }
     }
 
-    private static void streamStableFiles(OutputStream out, File outputDir, String boundary, Map<String, FileSnapshot> observed, Set<String> sent, JobState job) throws IOException {
+    private static void streamStableFiles(HttpServerResponse out, File outputDir, String boundary, Map<String, FileSnapshot> observed, Set<String> sent, JobState job) throws IOException {
         for (File file : listFiles(outputDir)) {
             String relative = outputDir.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/');
             FileSnapshot snapshot = new FileSnapshot(file.length(), file.lastModified());
@@ -593,7 +589,7 @@ public class TranscoderService extends Service {
         }
     }
 
-    private static void writeFilePart(OutputStream out, String boundary, File outputDir, File file, String relative) throws IOException {
+    private static void writeFilePart(HttpServerResponse out, String boundary, File outputDir, File file, String relative) throws IOException {
         ByteArrayOutputStream part = new ByteArrayOutputStream();
         part.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.US_ASCII));
         part.write("Content-Type: application/octet-stream\r\n".getBytes(StandardCharsets.US_ASCII));
@@ -603,10 +599,10 @@ public class TranscoderService extends Service {
         part.write(("Content-Length: " + file.length() + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
         Files.copy(file.toPath(), part);
         part.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-        writeChunk(out, part.toByteArray());
+        out.write(Buffer.buffer(part.toByteArray()));
     }
 
-    private static void writeExitPart(OutputStream out, String boundary, int exitCode, String stdout, String stderr) throws IOException {
+    private static void writeExitPart(HttpServerResponse out, String boundary, int exitCode, String stdout, String stderr) throws IOException {
         JSONObject json = new JSONObject();
         try {
             json.put("exitCode", exitCode);
@@ -622,17 +618,7 @@ public class TranscoderService extends Service {
         finalPart.write(("Content-Length: " + body.length + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
         finalPart.write(body);
         finalPart.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.US_ASCII));
-        writeChunk(out, finalPart.toByteArray());
-        out.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
-        out.flush();
-    }
-
-    private static void writeChunk(OutputStream out, byte[] bytes) throws IOException {
-        out.write(Integer.toHexString(bytes.length).getBytes(StandardCharsets.US_ASCII));
-        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-        out.write(bytes);
-        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-        out.flush();
+        out.end(Buffer.buffer(finalPart.toByteArray()));
     }
 
     private static List<File> listFiles(File directory) {
@@ -698,10 +684,13 @@ public class TranscoderService extends Service {
         final long startedAtMillis;
         final AtomicLong inputBytes = new AtomicLong();
         final AtomicLong outputFiles = new AtomicLong();
+        final ExecutorService stdinExecutor = Executors.newSingleThreadExecutor();
         volatile long lastActivityMillis;
         volatile String cancelReason = "";
         volatile Process process;
         volatile File outputDir;
+        volatile boolean processExited;
+        volatile int exitCode = -1;
         final StringBuffer stdoutText = new StringBuffer();
         final StringBuffer stderrText = new StringBuffer();
 
@@ -749,6 +738,7 @@ public class TranscoderService extends Service {
             if (activeProcess != null) {
                 activeProcess.destroyForcibly();
             }
+            stdinExecutor.shutdownNow();
         }
 
         JSONObject toJson() throws Exception {
@@ -765,7 +755,7 @@ public class TranscoderService extends Service {
                     .put("idleMillis", idleMillis())
                     .put("inputBytes", inputBytes.get())
                     .put("outputFiles", outputFiles.get())
-                    .put("processAlive", activeProcess != null && activeProcess.isAlive())
+                    .put("processAlive", activeProcess != null && !processExited)
                     .put("cancelReason", cancelReason);
             if (exitCode >= 0) {
                 json.put("exitCode", exitCode);
@@ -787,56 +777,6 @@ public class TranscoderService extends Service {
         }
     }
 
-    private static void pipeChunked(InputStream in, OutputStream out) throws IOException {
-        byte[] buffer = new byte[65536];
-        int read;
-        while ((read = in.read(buffer)) >= 0) {
-            if (read == 0) {
-                continue;
-            }
-            out.write(Integer.toHexString(read).getBytes(StandardCharsets.US_ASCII));
-            out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-            out.write(buffer, 0, read);
-            out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-            out.flush();
-        }
-        out.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
-        out.flush();
-    }
-
-    private static void copyChunkedRequest(JobState job, InputStream in, OutputStream out) throws IOException {
-        while (true) {
-            String sizeLine = readLine(in);
-            if (sizeLine == null) {
-                return;
-            }
-            int semicolon = sizeLine.indexOf(';');
-            String hex = semicolon >= 0 ? sizeLine.substring(0, semicolon) : sizeLine;
-            int size = Integer.parseInt(hex.trim(), 16);
-            if (size == 0) {
-                readLine(in);
-                return;
-            }
-            copyFixed(job, in, out, size);
-            readLine(in);
-        }
-    }
-
-    private static void copyFixed(JobState job, InputStream in, OutputStream out, long length) throws IOException {
-        byte[] buffer = new byte[65536];
-        long remaining = length;
-        while (remaining > 0) {
-            int read = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
-            if (read < 0) {
-                break;
-            }
-            out.write(buffer, 0, read);
-            INPUT_BYTES.addAndGet(read);
-            job.addInputBytes(read);
-            remaining -= read;
-        }
-    }
-
     private static String readAll(InputStream in) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         byte[] buffer = new byte[8192];
@@ -847,61 +787,19 @@ public class TranscoderService extends Service {
         return bytes.toString(StandardCharsets.UTF_8.name());
     }
 
-    private static void logStream(InputStream in, StringBuffer textBuffer, boolean stderr) {
-        try {
-            ByteArrayOutputStream line = new ByteArrayOutputStream();
-            int c;
-            while ((c = in.read()) >= 0) {
-                if (c == '\n') {
-                    String text = line.toString(StandardCharsets.UTF_8.name());
-                    textBuffer.append(text).append('\n');
-                    if (stderr) {
-                        Log.w(TAG, text);
-                    } else {
-                        Log.i(TAG, text);
-                    }
-                    line.reset();
-                } else {
-                    line.write(c);
-                }
-            }
-            if (line.size() > 0) {
-                String text = line.toString(StandardCharsets.UTF_8.name());
-                textBuffer.append(text).append('\n');
-                if (stderr) {
-                    Log.w(TAG, text);
-                } else {
-                    Log.i(TAG, text);
-                }
-            }
-        } catch (IOException ex) {
-            Log.w(TAG, "Failed reading ffmpeg " + (stderr ? "stderr" : "stdout"), ex);
-        }
+    private static void appendProcessOutput(JobState job, byte[] bytes, int length, boolean stderr) {
+        String text = new String(bytes, 0, length, StandardCharsets.UTF_8);
+        appendProcessText(stderr ? job.stderrText : job.stdoutText, text, stderr);
+        job.touchOutput();
     }
 
-    private static String readLine(InputStream in) throws IOException {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        int c;
-        while ((c = in.read()) >= 0) {
-            if (c == '\r') {
-                int next = in.read();
-                if (next == '\n') {
-                    break;
-                }
-                bytes.write(c);
-                if (next >= 0) {
-                    bytes.write(next);
-                }
-            } else if (c == '\n') {
-                break;
-            } else {
-                bytes.write(c);
-            }
+    private static void appendProcessText(StringBuffer textBuffer, String text, boolean stderr) {
+        textBuffer.append(text);
+        if (stderr) {
+            Log.w(TAG, text);
+        } else {
+            Log.i(TAG, text);
         }
-        if (c < 0 && bytes.size() == 0) {
-            return null;
-        }
-        return bytes.toString(StandardCharsets.US_ASCII.name());
     }
 
     private void createChannel() {
@@ -924,55 +822,21 @@ public class TranscoderService extends Service {
     }
 
     private static final class Request {
-        final String method;
         final String path;
-        final Map<String, String> query;
         final Map<String, String> headers;
 
-        Request(String method, String path, Map<String, String> query, Map<String, String> headers) {
-            this.method = method;
+        Request(String path, Map<String, String> headers) {
             this.path = path;
-            this.query = query;
             this.headers = headers;
         }
 
-        static Request read(InputStream in) throws IOException {
-            String requestLine = readLine(in);
-            if (requestLine == null || requestLine.isEmpty()) {
-                return null;
-            }
-            String[] parts = requestLine.split(" ");
-            if (parts.length < 2) {
-                return null;
-            }
+        static Request from(RoutingContext ctx) {
             Map<String, String> headers = new HashMap<>();
-            String line;
-            while ((line = readLine(in)) != null && !line.isEmpty()) {
-                int colon = line.indexOf(':');
-                if (colon > 0) {
-                    headers.put(line.substring(0, colon).trim().toLowerCase(Locale.ROOT),
-                            line.substring(colon + 1).trim());
-                }
+            for (Map.Entry<String, String> header : ctx.request().headers()) {
+                headers.put(header.getKey().toLowerCase(), header.getValue());
             }
-            String target = parts[1];
-            int question = target.indexOf('?');
-            String path = question >= 0 ? target.substring(0, question) : target;
-            Map<String, String> query = question >= 0 ? parseQuery(target.substring(question + 1)) : new HashMap<>();
-            return new Request(parts[0], path, query, headers);
-        }
-
-        private static Map<String, String> parseQuery(String queryString) throws IOException {
-            Map<String, String> result = new HashMap<>();
-            for (String part : queryString.split("&")) {
-                if (part.isEmpty()) {
-                    continue;
-                }
-                int equals = part.indexOf('=');
-                String key = equals >= 0 ? part.substring(0, equals) : part;
-                String value = equals >= 0 ? part.substring(equals + 1) : "";
-                result.put(URLDecoder.decode(key, "UTF-8"), URLDecoder.decode(value, "UTF-8"));
-            }
-            return result;
+            return new Request(ctx.normalizedPath(), headers);
         }
     }
+
 }
