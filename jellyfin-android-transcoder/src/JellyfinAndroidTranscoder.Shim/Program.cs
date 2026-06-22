@@ -400,9 +400,11 @@ public static class AndroidTranscode
     private static async Task<int> RunOnce(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
         using var startupTimeout = new CancellationTokenSource(RemoteStartupTimeout);
-        using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        using var controlClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        using var uploadClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        using var filesClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         var baseUri = config.AndroidBaseUrl.TrimEnd('/');
-        var job = await StartRemoteProcess(client, baseUri, config.Token, EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)), startupTimeout.Token);
+        var job = await StartRemoteProcess(controlClient, baseUri, config.Token, EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)), startupTimeout.Token);
 
         await using var input = File.OpenRead(command.InputPath!);
         await using var limitedInput = new RateLimitedReadStream(input, RemoteInputBytesPerSecond);
@@ -410,11 +412,11 @@ public static class AndroidTranscode
         stdinRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
         stdinRequest.Content = new StreamContent(limitedInput);
         stdinRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        var stdinTask = client.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead);
+        var stdinTask = uploadClient.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead);
 
         using var filesRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.FilesUrl);
         filesRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
-        using var filesResponse = await client.SendAsync(filesRequest, HttpCompletionOption.ResponseHeadersRead, startupTimeout.Token);
+        using var filesResponse = await filesClient.SendAsync(filesRequest, HttpCompletionOption.ResponseHeadersRead, startupTimeout.Token);
         filesResponse.EnsureSuccessStatusCode();
         var boundary = MultipartUtil.GetBoundary(filesResponse.Content.Headers.ContentType?.ToString()
             ?? throw new InvalidOperationException("Missing multipart content type"));

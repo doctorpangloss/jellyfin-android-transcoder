@@ -505,7 +505,12 @@ public class TranscoderService extends Service {
             writeJson(out, 404, response);
             return;
         }
-        job.cancel("api");
+        CURRENT_JOB.compareAndSet(job, null);
+        ACTIVE_JOBS.set(0);
+        executor.execute(() -> {
+            job.cancel("api");
+            deleteRecursively(job.workDir);
+        });
         response.put("canceled", true);
         response.put("job", job.toJson());
         writeJson(out, response);
