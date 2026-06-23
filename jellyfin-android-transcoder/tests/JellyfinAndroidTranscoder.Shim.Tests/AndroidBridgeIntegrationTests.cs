@@ -14,6 +14,7 @@ public sealed class AndroidBridgeIntegrationTests : IDisposable
 
     private readonly string _tempDir = Path.Combine(RepositoryRoot(), ".work", "shim-tests", Guid.NewGuid().ToString("N"));
     private readonly string? _previousConfig = Environment.GetEnvironmentVariable("JFAT_CONFIG");
+    private readonly string? _previousStartupTimeout = Environment.GetEnvironmentVariable("JFAT_REMOTE_STARTUP_TIMEOUT_SECONDS");
 
     public AndroidBridgeIntegrationTests()
     {
@@ -66,8 +67,7 @@ JSON
         Assert.Equal("ffmpeg", request.Executable);
         Assert.Contains("{outputRoot}/segment%d.ts", request.RemoteArgs);
         Assert.Contains("{outputRoot}/segment.m3u8", request.RemoteArgs);
-        Assert.Contains("\"-output_width\",\"320\"", request.RemoteArgs);
-        Assert.Contains("\"-output_height\",\"180\"", request.RemoteArgs);
+        Assert.Contains("\"-vf\",\"scale=320:180:flags=fast_bilinear\"", request.RemoteArgs);
         Assert.Contains("\"-g\",\"72\"", request.RemoteArgs);
         Assert.Contains("\"-hls_time\",\"3\"", request.RemoteArgs);
         Assert.Contains("\"-hls_flags\",\"temp_file\"", request.RemoteArgs);
@@ -168,6 +168,55 @@ JSON
         Assert.True(File.Exists(output), "The shim must expose FFmpeg's temp playlist at Jellyfin's requested .m3u8 path.");
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
         Assert.False(File.Exists(output + ".tmp"), "The temp playlist name is an FFmpeg implementation detail and must not leak to Jellyfin.");
+    }
+
+    [Fact]
+    public async Task StartupTimeoutDoesNotCancelLongRunningRemoteStreams()
+    {
+        Environment.SetEnvironmentVariable("JFAT_REMOTE_STARTUP_TIMEOUT_SECONDS", "1");
+        var ffmpeg = WriteExecutable("fake-ffmpeg-timeout.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe-timeout.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "timeout-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "large-timeout-window.mkv");
+        await using (var file = File.Create(input))
+        {
+            file.SetLength(64L * 1024 * 1024);
+        }
+        var output = Path.Combine(_tempDir, "timeout.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["timeout0.ts"] = "mpegts-timeout-window"u8.ToArray(),
+            ["timeout.m3u8"] = "#EXTM3U\n#EXTINF:3.000,\ntimeout0.ts\n#EXT-X-ENDLIST\n"u8.ToArray()
+        }, delayFilesAfterReady: TimeSpan.FromMilliseconds(1500));
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main([
+            "-i", $"file:{input}", "-codec:v:0", "libx264", "-maxrate", "63810668", "-bufsize", "127621336",
+            "-vf", @"scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2",
+            "-f", "hls", "-hls_time", "3", "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", Path.Combine(_tempDir, "timeout%d.ts"),
+            "-hls_playlist_type", "vod", "-hls_list_size", "0", "-y", output
+        ]);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", await File.ReadAllTextAsync(ffmpegLog));
+        Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
+        Assert.Equal("mpegts-timeout-window", await File.ReadAllTextAsync(Path.Combine(_tempDir, "timeout0.ts")));
     }
 
     [Fact]
@@ -338,13 +387,15 @@ JSON
 
         var request = await android.GetSingleRequest();
         Assert.Equal(1, android.StatusRequestCount);
-        Assert.Contains("\"-output_width\",\"1920\"", request.RemoteArgs);
-        Assert.Contains("\"-output_height\",\"1080\"", request.RemoteArgs);
+        Assert.Contains("\"-vf\",\"scale=1920:1080:flags=fast_bilinear\"", request.RemoteArgs);
         Assert.Contains("\"-b:v\",\"6000000\"", request.RemoteArgs);
         Assert.Contains("\"-maxrate\",\"6000000\"", request.RemoteArgs);
         Assert.Contains("\"-bufsize\",\"12000000\"", request.RemoteArgs);
         Assert.DoesNotContain("63810668", request.RemoteArgs);
         Assert.DoesNotContain("127621336", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hwaccel\",\"mediacodec\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hwaccel_output_format\",\"mediacodec\"", request.RemoteArgs);
+        Assert.Contains("\"-c:v\",\"h264_mediacodec\"", request.RemoteArgs);
         Assert.Contains("\"-hls_segment_type\",\"fmp4\"", request.RemoteArgs);
         Assert.Contains("\"-hls_fmp4_init_filename\",\"70e040ca627b1a5a2ecb0618aa77f67c-1.mp4\"", request.RemoteArgs);
         Assert.Contains("\"-hls_segment_options\",\"movflags=\\u002Bfrag_discont\"", request.RemoteArgs);
@@ -527,6 +578,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
     {
         Environment.SetEnvironmentVariable("JFAT_CONFIG", _previousConfig);
         Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", null);
+        Environment.SetEnvironmentVariable("JFAT_REMOTE_STARTUP_TIMEOUT_SECONDS", _previousStartupTimeout);
         Directory.Delete(_tempDir, recursive: true);
     }
 
@@ -694,12 +746,13 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
         private readonly bool _failFirstRemoteRequest;
         private readonly bool _failFilesStream;
         private readonly bool _holdFilesStreamOpen;
+        private readonly TimeSpan _delayFilesAfterReady;
         private readonly List<AndroidRequest> _requests = [];
         private readonly List<string> _deletePaths = [];
         private readonly TaskCompletionSource _filesStreamStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly Task _serverTask;
 
-        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest, bool failFilesStream, bool holdFilesStreamOpen)
+        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest, bool failFilesStream, bool holdFilesStreamOpen, TimeSpan delayFilesAfterReady)
         {
             _listener = listener;
             BaseUrl = baseUrl;
@@ -707,6 +760,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
             _failFirstRemoteRequest = failFirstRemoteRequest;
             _failFilesStream = failFilesStream;
             _holdFilesStreamOpen = holdFilesStreamOpen;
+            _delayFilesAfterReady = delayFilesAfterReady;
             _serverTask = Task.Run(Serve);
         }
 
@@ -734,14 +788,14 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
             }
         }
 
-        public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest = false, bool failFilesStream = false, bool holdFilesStreamOpen = false)
+        public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest = false, bool failFilesStream = false, bool holdFilesStreamOpen = false, TimeSpan delayFilesAfterReady = default)
         {
             var port = GetFreePort();
             var baseUrl = $"http://127.0.0.1:{port}";
             var listener = new HttpListener();
             listener.Prefixes.Add($"{baseUrl}/");
             listener.Start();
-            return Task.FromResult(new MockAndroidService(listener, baseUrl, files, failFirstRemoteRequest, failFilesStream, holdFilesStreamOpen));
+            return Task.FromResult(new MockAndroidService(listener, baseUrl, files, failFirstRemoteRequest, failFilesStream, holdFilesStreamOpen, delayFilesAfterReady));
         }
 
         public async Task WaitForFilesStream()
@@ -897,6 +951,10 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
                     var ready = Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/octet-stream\r\nX-Remote-Event: ready\r\nContent-Length: 0\r\n\r\n\r\n");
                     await context.Response.OutputStream.WriteAsync(ready);
                     await context.Response.OutputStream.FlushAsync();
+                    if (_delayFilesAfterReady > TimeSpan.Zero)
+                    {
+                        await Task.Delay(_delayFilesAfterReady);
+                    }
                     if (_holdFilesStreamOpen)
                     {
                         _ = Task.Run(async () =>

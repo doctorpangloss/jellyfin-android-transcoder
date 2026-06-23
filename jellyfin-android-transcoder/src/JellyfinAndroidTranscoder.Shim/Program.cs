@@ -373,7 +373,12 @@ public static class AndroidTranscode
     private const int RemoteInputBytesPerSecond = 10_000_000;
     private const int RemoteAttempts = 2;
     private static readonly TimeSpan HealthCheckTimeout = TimeSpan.FromSeconds(3);
-    private static readonly TimeSpan RemoteStartupTimeout = TimeSpan.FromSeconds(45);
+    private static TimeSpan RemoteStartupTimeout => TimeSpan.FromSeconds(ReadPositiveInt("JFAT_REMOTE_STARTUP_TIMEOUT_SECONDS", 45));
+
+    private static int ReadPositiveInt(string name, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) && value > 0
+            ? value
+            : fallback;
 
     public static async Task<int> Run(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
@@ -428,7 +433,6 @@ public static class AndroidTranscode
     {
         using var startupTimeout = new CancellationTokenSource(RemoteStartupTimeout);
         using var remoteStop = new CancellationTokenSource();
-        using var remoteIo = CancellationTokenSource.CreateLinkedTokenSource(startupTimeout.Token, remoteStop.Token);
         using var controlClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         using var uploadClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         using var filesClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
@@ -444,13 +448,13 @@ public static class AndroidTranscode
         stdinRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
         stdinRequest.Content = new StreamContent(limitedInput);
         stdinRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        var stdinTask = uploadClient.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead, remoteIo.Token);
+        var stdinTask = uploadClient.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead, remoteStop.Token);
 
         try
         {
             using var filesRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.FilesUrl);
             filesRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
-            var filesResponseTask = filesClient.SendAsync(filesRequest, HttpCompletionOption.ResponseHeadersRead, remoteIo.Token);
+            var filesResponseTask = filesClient.SendAsync(filesRequest, HttpCompletionOption.ResponseHeadersRead, startupTimeout.Token);
             if (await Task.WhenAny(filesResponseTask, stopRequest.Task) == stopRequest.Task)
             {
                 return await StopRemoteProcess(controlClient, baseUri, config.Token, job.Id, remoteStop, await stopRequest.Task);
@@ -459,7 +463,7 @@ public static class AndroidTranscode
             filesResponse.EnsureSuccessStatusCode();
             var boundary = MultipartUtil.GetBoundary(filesResponse.Content.Headers.ContentType?.ToString()
                 ?? throw new InvalidOperationException("Missing multipart content type"));
-            await using (var files = await filesResponse.Content.ReadAsStreamAsync(startupTimeout.Token))
+            await using (var files = await filesResponse.Content.ReadAsStreamAsync(remoteStop.Token))
             {
                 var materializeTask = MultipartUtil.MaterializeFiles(files, boundary, command);
                 if (await Task.WhenAny(materializeTask, stopRequest.Task) == stopRequest.Task)
@@ -619,7 +623,7 @@ public static class AndroidTranscode
         var hlsSegmentType = string.Equals(command.ValueAfter("-hls_segment_type"), "fmp4", StringComparison.OrdinalIgnoreCase)
             ? "fmp4"
             : "mpegts";
-        var useHardwareFrames = config.HardwareCodecsEnabled && string.IsNullOrWhiteSpace(command.SeekBeforeInput);
+        var useHardwareFrames = false;
         var args = new List<string>
         {
             "-hide_banner",
