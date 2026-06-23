@@ -927,6 +927,7 @@ public class TranscoderService extends Service {
     }
 
     private static void streamProcessStdout(JobState job, Buffer buffer) {
+        appendProcessText(job.stdoutText, buffer.toString(StandardCharsets.UTF_8), false);
         job.stdoutBytes.addAndGet(buffer.length());
         job.touchOutput();
         List<HttpServerResponse> subscribers;
