@@ -7,4 +7,6 @@ public sealed record ShimConfigFile(
     string RealFfmpegPath,
     string RealFfprobePath,
     int MaxBitrate,
-    bool UseHardwareCodecs);
+    bool UseHardwareCodecs,
+    string JellyfinBaseUrl,
+    string SourceSecret);

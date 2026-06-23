@@ -62,7 +62,7 @@ build_one() {
     --enable-network \
     --enable-protocol='file,pipe,http,tcp' \
     --enable-demuxer='matroska,mov,mpegts' \
-    --enable-muxer='hls,mpegts,null,mp4,matroska' \
+    --enable-muxer='hls,segment,mpegts,null,mp4,matroska' \
     --enable-parser='hevc,h264' \
     --enable-bsf='hevc_mp4toannexb,h264_mp4toannexb,extract_extradata,h264_metadata,hevc_metadata' \
     --enable-decoder='hevc,hevc_mediacodec,h264,h264_mediacodec' \

@@ -92,6 +92,23 @@ public final class TranscoderServiceInstrumentedTest {
     }
 
     @Test
+    public void testSetupUrlUsesRandomFourDigitTokenAndResetChangesIt() {
+        context.getSharedPreferences("android-transcoder", Context.MODE_PRIVATE)
+                .edit()
+                .remove("token")
+                .apply();
+
+        String first = AppConfig.token(context);
+        assertTrue(first.matches("[0-9]{4}"));
+        assertTrue(AppConfig.setupUrl(context).contains("?token=" + first));
+
+        String reset = AppConfig.resetToken(context);
+        assertTrue(reset.matches("[0-9]{4}"));
+        assertFalse(first.equals(reset));
+        assertTrue(AppConfig.setupUrl(context).contains("?token=" + reset));
+    }
+
+    @Test
     public void testBootReceiverStartsServiceOnlyWhenEnabled() throws Exception {
         context.stopService(new Intent(context, TranscoderService.class));
         waitForStopped();

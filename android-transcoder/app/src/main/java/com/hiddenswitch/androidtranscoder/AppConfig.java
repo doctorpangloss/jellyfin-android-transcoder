@@ -20,6 +20,7 @@ final class AppConfig {
     private static final String TOKEN = "token";
     private static final String START_ON_BOOT = "startOnBoot";
     private static final String KEEP_AWAKE = "keepAwake";
+    private static final String PAIRED_JELLYFIN_URL = "pairedJellyfinUrl";
 
     private AppConfig() {
     }
@@ -45,6 +46,20 @@ final class AppConfig {
                 .apply();
     }
 
+    static String resetToken(Context context) {
+        String existing = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(TOKEN, null);
+        String token;
+        do {
+            token = String.format("%04d", new SecureRandom().nextInt(10000));
+        } while (token.equals(existing));
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(TOKEN, token)
+                .apply();
+        return token;
+    }
+
     static boolean startOnBoot(Context context) {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getBoolean(START_ON_BOOT, true);
@@ -59,7 +74,7 @@ final class AppConfig {
 
     static boolean keepAwake(Context context) {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getBoolean(KEEP_AWAKE, false);
+                .getBoolean(KEEP_AWAKE, true);
     }
 
     static void setKeepAwake(Context context, boolean enabled) {
@@ -71,6 +86,18 @@ final class AppConfig {
 
     static String ffmpegPath(Context context) {
         return context.getApplicationInfo().nativeLibraryDir + "/libffmpeg.so";
+    }
+
+    static String pairedJellyfinUrl(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(PAIRED_JELLYFIN_URL, "");
+    }
+
+    static void setPairedJellyfinUrl(Context context, String url) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PAIRED_JELLYFIN_URL, url == null ? "" : url)
+                .apply();
     }
 
     static List<String> baseUrls() {
@@ -113,6 +140,12 @@ final class AppConfig {
         } catch (Exception ex) {
             return "{}";
         }
+    }
+
+    static String setupUrl(Context context) {
+        List<String> urls = baseUrls();
+        String baseUrl = urls.isEmpty() ? "http://PHONE_IP:" + PORT : urls.get(0);
+        return baseUrl + "/?token=" + token(context);
     }
 
     private static boolean isShortCode(String token) {

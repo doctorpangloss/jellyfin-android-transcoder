@@ -29,7 +29,9 @@ internal static class ShimInstaller
             config.RealFfmpegPath,
             config.RealFfprobePath,
             config.MaxBitrate,
-            config.UseHardwareCodecs);
+            config.UseHardwareCodecs,
+            config.JellyfinBaseUrl,
+            config.SourceSecret);
         var path = Path.Combine(Path.GetDirectoryName(config.ShimPath)!, "shim-config.json");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, JsonSerializer.Serialize(shimConfig, new JsonSerializerOptions { WriteIndented = true }));

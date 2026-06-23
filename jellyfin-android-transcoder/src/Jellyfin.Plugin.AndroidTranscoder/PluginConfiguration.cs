@@ -20,6 +20,12 @@ public sealed class PluginConfiguration : BasePluginConfiguration
 
     public bool UseHardwareCodecs { get; set; } = true;
 
+    public string JellyfinBaseUrl { get; set; } = string.Empty;
+
+    public string SourceSecret { get; set; } = string.Empty;
+
+    public string[] AllowedSourceRoots { get; set; } = [];
+
     public string PairingCode { get; set; } = string.Empty;
 
     public DateTime PairingCodeExpiresUtc { get; set; }

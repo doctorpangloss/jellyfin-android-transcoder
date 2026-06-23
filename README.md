@@ -78,9 +78,8 @@ After the APK downloads:
 5. If Play Protect appears, expand **More details** if needed and choose **Install anyway** or **Continue**. A message like **Play Protect is already turned on** is not the final install confirmation.
 6. Tap **Install**.
 7. After installation, open **Android Transcoder**.
-8. Enable **Start on boot** and **Keep screen and Wi-Fi awake**.
-9. Tap **Start Service**.
-10. Confirm Jellyfin can reach the phone by opening `http://PHONE_IP:8098/api/v1/status` from the Jellyfin server or container network.
+8. Leave **Keep awake** enabled. It is on by default so the phone keeps the CPU, screen, and Wi-Fi active while it is acting as Jellyfin's video engine.
+9. Confirm Jellyfin can reach the phone by opening `http://PHONE_IP:8098/api/v1/status` from the Jellyfin server or container network.
 
 If Android returns to the downloads screen without showing **App installed**, the APK was not installed. Reopen the APK and finish the prompts above.
 
@@ -105,7 +104,17 @@ java -jar bundletool-all-1.18.3.jar install-apks \
   --device-id <adb-device-id>
 ```
 
-The app must be reachable from the Jellyfin container. On Tailscale, use the phone's Tailscale IP in the plugin JSON or Jellyfin plugin settings.
+The app must be reachable from the Jellyfin container. On Tailscale, use the phone's Tailscale IP in the setup URL or Jellyfin plugin settings.
+
+### Android App Screens
+
+The **Pairing** tab shows one QR action and one copy/paste setup URL. Tap the URL itself or tap **Copy setup URL** to copy it to the clipboard. The token in the URL is a random four-digit setup code generated on first start. Use **Reset setup code** to rotate it.
+
+![Android Transcoder pairing screen](docs/assets/android-pairing.png)
+
+The **Status** tab shows service state, whether keep-awake is enabled, and active job counters.
+
+![Android Transcoder status screen](docs/assets/android-status.png)
 
 ## Jellyfin Docker Compose Example
 
@@ -142,12 +151,30 @@ Install the plugin:
    ```
 
 4. Restart Jellyfin.
-5. Open **Dashboard -> Plugins -> Android Transcoder**.
-6. Paste the Android app JSON and save.
-7. Click **Test Connection**.
-8. Click **Install Shim**.
-9. Click **Use Shim FFmpeg**.
-10. Restart Jellyfin once more after changing the FFmpeg path.
+5. Open **Dashboard -> Plugins -> Android Transcoder**. The embedded Jellyfin plugin page redirects to the live Android Transcoder page at `/AndroidTranscoder/Page`.
+6. Open **Android Transcoder** on the phone.
+7. Tap **Pair from QR**.
+8. Scan the QR code shown by Jellyfin.
+9. Click **Refresh status** in Jellyfin. The page should show **Connected**.
+10. Leave **Use this phone for video transcodes** enabled.
+11. Leave **Use Android hardware codecs** enabled unless you are debugging the software path.
+
+The live plugin page tests the configured Android device from Jellyfin every time it renders, using a 1 second health check. If the phone cannot reach the QR URL, open Jellyfin using a URL the phone can visit and scan that QR code instead. If Jellyfin cannot reach the phone, use the phone's setup URL described below.
+
+![Jellyfin Android Transcoder plugin page](docs/assets/jellyfin-plugin-page.png)
+
+Manual setup, if QR pairing is not available:
+
+1. In the Android app, tap **Copy setup URL**. It looks like:
+
+   ```text
+   http://PHONE_IP:8098/?token=1234
+   ```
+
+2. In Jellyfin, paste that one URL into **Manual setup**.
+3. Click **Use setup URL**.
+4. Click **Refresh status**.
+5. Confirm the page shows **Connected** and the configured phone URL.
 
 The plugin writes the shim to:
 

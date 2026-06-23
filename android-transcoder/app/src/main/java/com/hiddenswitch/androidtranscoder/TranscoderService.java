@@ -66,6 +66,7 @@ public class TranscoderService extends Service {
     private static volatile boolean running;
     private static volatile boolean listening;
     private static volatile String listenError = "";
+    private static volatile String pairingStatus = "No pairing attempt yet";
 
     private ExecutorService executor;
     private Vertx vertx;
@@ -83,6 +84,14 @@ public class TranscoderService extends Service {
 
     static String listenError() {
         return listenError;
+    }
+
+    static void setPairingStatusForUi(String message) {
+        pairingStatus = message == null || message.isEmpty() ? "No pairing attempt yet" : message;
+    }
+
+    static String pairingStatusForUi() {
+        return pairingStatus;
     }
 
     static String statusSummaryForUi() {
@@ -191,6 +200,7 @@ public class TranscoderService extends Service {
         router.post("/api/v1/remoteprocesses").handler(this::handleRemoteProcess);
         router.putWithRegex("/api/v1/remoteprocesses/[^/]+/stdin").handler(this::handleRemoteProcessStdin);
         router.getWithRegex("/api/v1/remoteprocesses/[^/]+/files").handler(this::handleRemoteProcessFiles);
+        router.getWithRegex("/api/v1/remoteprocesses/[^/]+/stdout").handler(this::handleRemoteProcessStdout);
         router.route().handler(ctx -> ctx.response().setStatusCode(404).end("not found\n"));
 
         httpServer = vertx.createHttpServer().requestHandler(router);
@@ -296,6 +306,14 @@ public class TranscoderService extends Service {
         }
     }
 
+    private void handleRemoteProcessStdout(RoutingContext ctx) {
+        try {
+            streamRemoteProcessStdout(Request.from(ctx), ctx.response());
+        } catch (Exception ex) {
+            fail(ctx, ex);
+        }
+    }
+
     private void fail(RoutingContext ctx, Exception ex) {
         Log.e(TAG, "Request failed", ex);
         if (!ctx.response().ended()) {
@@ -357,7 +375,7 @@ public class TranscoderService extends Service {
             io.reactiverse.childprocess.Process.create(vertx, command.get(0), command.subList(1, command.size()))
                     .startHandler(process -> {
                         job.setProcess(process);
-                        process.stdout().handler(buffer -> appendProcessOutput(job, buffer, false));
+                        process.stdout().handler(buffer -> streamProcessStdout(job, buffer));
                         process.stdout().exceptionHandler(ex -> appendProcessText(job.stderrText, "stdout read failed: " + ex + "\n", true));
                         process.stderr().handler(buffer -> appendProcessOutput(job, buffer, true));
                         process.stderr().exceptionHandler(ex -> appendProcessText(job.stderrText, "stderr read failed: " + ex + "\n", true));
@@ -368,12 +386,18 @@ public class TranscoderService extends Service {
                             }
                             job.processExited = true;
                             job.touchOutput();
+                            try {
+                                LAST_JOB_JSON.set(job.toJson(code, "").toString());
+                            } catch (Exception ignored) {
+                            }
+                            closeStdoutSubscribers(job);
                         });
                         try {
                             JSONObject body = new JSONObject()
                                     .put("id", job.id)
                                     .put("stdinUrl", "/api/v1/remoteprocesses/" + job.id + "/stdin")
-                                    .put("filesUrl", "/api/v1/remoteprocesses/" + job.id + "/files");
+                                    .put("filesUrl", "/api/v1/remoteprocesses/" + job.id + "/files")
+                                    .put("stdoutUrl", "/api/v1/remoteprocesses/" + job.id + "/stdout");
                             writeJson(response, body);
                         } catch (Exception ex) {
                             failStart(job, response, ex);
@@ -462,6 +486,28 @@ public class TranscoderService extends Service {
         streamMultipartTick(response, boundary, observed, sent, job, 0);
     }
 
+    private void streamRemoteProcessStdout(Request request, HttpServerResponse response) {
+        JobState job = jobFromPath(request.path, "/stdout");
+        if (job == null || job.process == null) {
+            writeText(response, 404, "job not found\n");
+            return;
+        }
+        response.setStatusCode(200)
+                .putHeader("Content-Type", "application/octet-stream")
+                .setChunked(true);
+        synchronized (job.stdoutSubscribers) {
+            job.stdoutSubscribers.add(response);
+        }
+        response.exceptionHandler(ex -> removeStdoutSubscriber(job, response));
+        response.closeHandler(ignored -> removeStdoutSubscriber(job, response));
+        if (job.processExited) {
+            removeStdoutSubscriber(job, response);
+            if (!response.ended()) {
+                response.end();
+            }
+        }
+    }
+
     private JobState jobFromPath(String path, String suffix) {
         String prefix = "/api/v1/remoteprocesses/";
         if (!path.startsWith(prefix) || !path.endsWith(suffix)) {
@@ -500,6 +546,7 @@ public class TranscoderService extends Service {
     }
 
     private void pairWithJellyfin(String pairUrl) {
+        pairingStatus = "Pairing with Jellyfin...";
         try {
             JSONObject payload = new JSONObject(AppConfig.connectionJson(this));
             HttpURLConnection connection = (HttpURLConnection) new URL(pairUrl).openConnection();
@@ -518,6 +565,7 @@ public class TranscoderService extends Service {
             String text = response == null ? "" : readAll(response);
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "Pairing failed: HTTP " + status + " " + text);
+                pairingStatus = "Jellyfin was reached, but rejected pairing: HTTP " + status;
                 return;
             }
             JSONObject json = new JSONObject(text);
@@ -525,8 +573,11 @@ public class TranscoderService extends Service {
             if (!token.isEmpty()) {
                 AppConfig.setToken(this, token);
             }
+            AppConfig.setPairedJellyfinUrl(this, pairUrl);
+            pairingStatus = "Paired with Jellyfin";
             Log.i(TAG, "Paired with Jellyfin at " + pairUrl);
         } catch (Exception ex) {
+            pairingStatus = "Jellyfin server could not be reached. Open the Android Transcoder page using a Jellyfin URL this phone can visit, then scan that QR code.";
             Log.w(TAG, "Pairing failed", ex);
         }
     }
@@ -765,6 +816,8 @@ public class TranscoderService extends Service {
         volatile File outputDir;
         volatile boolean processExited;
         volatile int exitCode = -1;
+        final List<HttpServerResponse> stdoutSubscribers = new ArrayList<>();
+        final AtomicLong stdoutBytes = new AtomicLong();
         final StringBuffer stdoutText = new StringBuffer();
         final StringBuffer stderrText = new StringBuffer();
 
@@ -833,6 +886,7 @@ public class TranscoderService extends Service {
                     .put("ageMillis", ageMillis())
                     .put("idleMillis", idleMillis())
                     .put("inputBytes", inputBytes.get())
+                    .put("stdoutBytes", stdoutBytes.get())
                     .put("outputFiles", outputFiles.get())
                     .put("processAlive", activeProcess != null && !processExited)
                     .put("cancelReason", cancelReason);
@@ -870,6 +924,37 @@ public class TranscoderService extends Service {
         String text = buffer.toString(StandardCharsets.UTF_8);
         appendProcessText(stderr ? job.stderrText : job.stdoutText, text, stderr);
         job.touchOutput();
+    }
+
+    private static void streamProcessStdout(JobState job, Buffer buffer) {
+        job.stdoutBytes.addAndGet(buffer.length());
+        job.touchOutput();
+        List<HttpServerResponse> subscribers;
+        synchronized (job.stdoutSubscribers) {
+            subscribers = new ArrayList<>(job.stdoutSubscribers);
+        }
+        for (HttpServerResponse subscriber : subscribers) {
+            subscriber.write(buffer.copy()).onFailure(ex -> removeStdoutSubscriber(job, subscriber));
+        }
+    }
+
+    private static void closeStdoutSubscribers(JobState job) {
+        List<HttpServerResponse> subscribers;
+        synchronized (job.stdoutSubscribers) {
+            subscribers = new ArrayList<>(job.stdoutSubscribers);
+            job.stdoutSubscribers.clear();
+        }
+        for (HttpServerResponse subscriber : subscribers) {
+            if (!subscriber.ended()) {
+                subscriber.end();
+            }
+        }
+    }
+
+    private static void removeStdoutSubscriber(JobState job, HttpServerResponse subscriber) {
+        synchronized (job.stdoutSubscribers) {
+            job.stdoutSubscribers.remove(subscriber);
+        }
     }
 
     private static void appendProcessText(StringBuffer textBuffer, String text, boolean stderr) {

@@ -35,6 +35,11 @@ public sealed class StartupShimInstaller : IHostedService
 
         try
         {
+            if (SourceSettings.Ensure(config, _configurationManager))
+            {
+                plugin.SaveConfiguration(config);
+            }
+
             ShimInstaller.Install(config);
 
             var options = _configurationManager.GetEncodingOptions();

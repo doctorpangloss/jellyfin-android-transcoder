@@ -2,125 +2,19 @@
 <html>
 <head>
     <title>Android Transcoder</title>
+    <meta http-equiv="refresh" content="0; url=/AndroidTranscoder/Page" />
 </head>
 <body>
 <div id="AndroidTranscoderConfigPage" data-role="page" class="page type-interior pluginConfigurationPage">
     <div data-role="content">
         <div class="content-primary">
             <h1>Android Transcoder</h1>
-            <form class="androidTranscoderForm">
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtPastedConfig">Android app JSON</label>
-                    <textarea id="txtPastedConfig" class="emby-input" rows="8"></textarea>
-                </div>
-                <button is="emby-button" type="button" class="raised button-submit" id="btnImport">Import App JSON</button>
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="chkEnabled" />
-                        <span>Enable Android routing</span>
-                    </label>
-                </div>
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="chkHardware" />
-                        <span>Use Android hardware codecs</span>
-                    </label>
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtBaseUrl">Android base URL</label>
-                    <input is="emby-input" id="txtBaseUrl" type="text" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtToken">Token</label>
-                    <input is="emby-input" id="txtToken" type="password" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtMaxBitrate">Max bitrate</label>
-                    <input is="emby-input" id="txtMaxBitrate" type="number" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtShimPath">Shim path</label>
-                    <input is="emby-input" id="txtShimPath" type="text" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtRealFfmpeg">Real FFmpeg path</label>
-                    <input is="emby-input" id="txtRealFfmpeg" type="text" />
-                </div>
-                <button is="emby-button" type="submit" class="raised button-submit">Save</button>
-                <button is="emby-button" type="button" class="raised" id="btnPair">Generate Pairing Code</button>
-                <button is="emby-button" type="button" class="raised" id="btnTest">Test Connection</button>
-                <button is="emby-button" type="button" class="raised" id="btnInstallShim">Install Shim</button>
-                <button is="emby-button" type="button" class="raised" id="btnApply">Use Shim FFmpeg</button>
-                <button is="emby-button" type="button" class="raised" id="btnRestore">Restore Real FFmpeg</button>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtPairingUrl">Pairing URL</label>
-                    <input is="emby-input" id="txtPairingUrl" type="text" readonly />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="txtPairingCommand">ADB pairing command</label>
-                    <textarea id="txtPairingCommand" class="emby-input" rows="3" readonly></textarea>
-                </div>
-                <pre id="txtStatus"></pre>
+            <p>Open the live Android Transcoder status page to pair a phone and test the current connection.</p>
+            <form action="/AndroidTranscoder/Page" method="get">
+                <button is="emby-button" type="submit" class="raised button-submit">Open Android Transcoder</button>
             </form>
         </div>
     </div>
 </div>
-<script>
-    (() => {
-        const page = document.querySelector('#AndroidTranscoderConfigPage');
-        const api = window.ApiClient;
-        const status = page.querySelector('#txtStatus');
-        const show = value => status.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-
-        async function load() {
-            const c = await api.getJSON(api.getUrl('AndroidTranscoder/Configuration'));
-            page.querySelector('#chkEnabled').checked = !!c.Enabled;
-            page.querySelector('#chkHardware').checked = c.UseHardwareCodecs !== false;
-            page.querySelector('#txtBaseUrl').value = c.AndroidBaseUrl || '';
-            page.querySelector('#txtToken').value = c.Token || '';
-            page.querySelector('#txtMaxBitrate').value = c.MaxBitrate || 6000000;
-            page.querySelector('#txtShimPath').value = c.ShimPath || '';
-            page.querySelector('#txtRealFfmpeg').value = c.RealFfmpegPath || '';
-        }
-
-        function readConfig() {
-            return {
-                Enabled: page.querySelector('#chkEnabled').checked,
-                UseHardwareCodecs: page.querySelector('#chkHardware').checked,
-                AndroidBaseUrl: page.querySelector('#txtBaseUrl').value,
-                Token: page.querySelector('#txtToken').value,
-                MaxBitrate: parseInt(page.querySelector('#txtMaxBitrate').value || '6000000', 10),
-                ShimPath: page.querySelector('#txtShimPath').value,
-                RealFfmpegPath: page.querySelector('#txtRealFfmpeg').value,
-                RealFfprobePath: '/usr/lib/jellyfin-ffmpeg/ffprobe'
-            };
-        }
-
-        page.querySelector('form').addEventListener('submit', async e => {
-            e.preventDefault();
-            await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/Configuration'), data: JSON.stringify(readConfig()), contentType: 'application/json' });
-            show('saved');
-        });
-        page.querySelector('#btnImport').addEventListener('click', async () => {
-            const pasted = JSON.parse(page.querySelector('#txtPastedConfig').value);
-            await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/Connection'), data: JSON.stringify(pasted), contentType: 'application/json' });
-            await load();
-            show('imported');
-        });
-        page.querySelector('#btnTest').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/Test') })));
-        page.querySelector('#btnPair').addEventListener('click', async () => {
-            const pairing = await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/Pairing') });
-            const pairUrl = api.getUrl(pairing.path.replace(/^\//, ''));
-            const command = `adb shell am start-foreground-service -n com.hiddenswitch.androidtranscoder/.TranscoderService -e pairUrl "${pairUrl}" --ez startOnBoot true --ez keepAwake true`;
-            page.querySelector('#txtPairingUrl').value = pairUrl;
-            page.querySelector('#txtPairingCommand').value = command;
-            show(pairing);
-        });
-        page.querySelector('#btnInstallShim').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/InstallShim') })));
-        page.querySelector('#btnApply').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/ApplyFfmpegPath') })));
-        page.querySelector('#btnRestore').addEventListener('click', async () => show(await api.ajax({ type: 'POST', url: api.getUrl('AndroidTranscoder/RestoreFfmpegPath') })));
-        page.addEventListener('pageshow', load);
-    })();
-</script>
 </body>
 </html>
