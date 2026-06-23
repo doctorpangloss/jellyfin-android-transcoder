@@ -623,7 +623,7 @@ public static class AndroidTranscode
         var hlsSegmentType = string.Equals(command.ValueAfter("-hls_segment_type"), "fmp4", StringComparison.OrdinalIgnoreCase)
             ? "fmp4"
             : "mpegts";
-        var useHardwareFrames = false;
+        var useHardwareFrames = config.HardwareCodecsEnabled && string.IsNullOrWhiteSpace(command.SeekBeforeInput);
         var args = new List<string>
         {
             "-hide_banner",
@@ -635,7 +635,9 @@ public static class AndroidTranscode
                 "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
                 "-hwaccel", "mediacodec",
                 "-hwaccel_device", "mc",
-                "-hwaccel_output_format", "mediacodec"
+                "-hwaccel_output_format", "mediacodec",
+                "-c:v", "hevc_mediacodec",
+                "-ndk_codec", "1"
             ]);
         }
         if (probe.DurationSeconds > 0)
