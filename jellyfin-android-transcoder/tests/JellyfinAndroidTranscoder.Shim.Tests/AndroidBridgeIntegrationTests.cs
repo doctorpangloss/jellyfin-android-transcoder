@@ -67,12 +67,10 @@ JSON
         Assert.Equal("ffmpeg", request.Executable);
         Assert.Contains("{outputRoot}/segment%d.ts", request.RemoteArgs);
         Assert.Contains("{outputRoot}/segment.m3u8", request.RemoteArgs);
-        Assert.Contains("\"-hwaccel\",\"mediacodec\"", request.RemoteArgs);
-        Assert.Contains("\"-hwaccel_output_format\",\"mediacodec\"", request.RemoteArgs);
         Assert.Contains("\"-c:v\",\"hevc_mediacodec\"", request.RemoteArgs);
         Assert.Contains("\"-ndk_codec\",\"1\"", request.RemoteArgs);
-        Assert.Contains("\"-output_width\",\"320\"", request.RemoteArgs);
-        Assert.Contains("\"-output_height\",\"180\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hwaccel_output_format\",\"mediacodec\"", request.RemoteArgs);
+        Assert.Contains("\"-vf\",\"scale=320:180:flags=fast_bilinear\"", request.RemoteArgs);
         Assert.Contains("\"-g\",\"72\"", request.RemoteArgs);
         Assert.Contains("\"-hls_time\",\"3\"", request.RemoteArgs);
         Assert.Contains("\"-hls_flags\",\"temp_file\"", request.RemoteArgs);
@@ -392,12 +390,10 @@ JSON
 
         var request = await android.GetSingleRequest();
         Assert.Equal(1, android.StatusRequestCount);
-        Assert.Contains("\"-hwaccel\",\"mediacodec\"", request.RemoteArgs);
-        Assert.Contains("\"-hwaccel_output_format\",\"mediacodec\"", request.RemoteArgs);
         Assert.Contains("\"-c:v\",\"hevc_mediacodec\"", request.RemoteArgs);
         Assert.Contains("\"-ndk_codec\",\"1\"", request.RemoteArgs);
-        Assert.Contains("\"-output_width\",\"1920\"", request.RemoteArgs);
-        Assert.Contains("\"-output_height\",\"1080\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hwaccel_output_format\",\"mediacodec\"", request.RemoteArgs);
+        Assert.Contains("\"-vf\",\"scale=1920:1080:flags=fast_bilinear\"", request.RemoteArgs);
         Assert.Contains("\"-b:v\",\"6000000\"", request.RemoteArgs);
         Assert.Contains("\"-maxrate\",\"6000000\"", request.RemoteArgs);
         Assert.Contains("\"-bufsize\",\"12000000\"", request.RemoteArgs);

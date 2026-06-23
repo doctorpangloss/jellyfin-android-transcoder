@@ -612,7 +612,6 @@ public static class AndroidTranscode
 
     private static IReadOnlyList<string> BuildRemoteFfmpegArgs(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
-        var toneMap = probe.IsHdr ? 1 : 0;
         var bitrate = Math.Min(command.MaxRate, config.MaxBitrate);
         var (outputWidth, outputHeight) = OutputDimensions(command, probe);
         var hlsTime = command.ValueAfter("-hls_time") ?? command.GopSeconds.ToString(CultureInfo.InvariantCulture);
@@ -623,19 +622,15 @@ public static class AndroidTranscode
         var hlsSegmentType = string.Equals(command.ValueAfter("-hls_segment_type"), "fmp4", StringComparison.OrdinalIgnoreCase)
             ? "fmp4"
             : "mpegts";
-        var useHardwareFrames = config.HardwareCodecsEnabled && string.IsNullOrWhiteSpace(command.SeekBeforeInput);
+        var useHardwareDecoder = config.HardwareCodecsEnabled;
         var args = new List<string>
         {
             "-hide_banner",
             "-loglevel", "warning"
         };
-        if (useHardwareFrames)
+        if (useHardwareDecoder)
         {
             args.AddRange([
-                "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
-                "-hwaccel", "mediacodec",
-                "-hwaccel_device", "mc",
-                "-hwaccel_output_format", "mediacodec",
                 "-c:v", "hevc_mediacodec",
                 "-ndk_codec", "1"
             ]);
@@ -657,31 +652,14 @@ public static class AndroidTranscode
             args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
         }
         args.AddRange(["-map", "0:v:0"]);
-        if (useHardwareFrames)
-        {
-            args.AddRange([
-                "-c:v", "h264_mediacodec",
-                "-pix_fmt", "mediacodec",
-                "-output_width", outputWidth.ToString(),
-                "-output_height", outputHeight.ToString(),
-                "-surface_tonemap", toneMap.ToString(),
-                "-b:v", bitrate.ToString(),
-                "-maxrate", bitrate.ToString(),
-                "-bufsize", (bitrate * 2).ToString(),
-                "-bitrate_mode", "cbr"
-            ]);
-        }
-        else
-        {
-            args.AddRange([
-                "-vf", $"scale={outputWidth}:{outputHeight}:flags=fast_bilinear",
-                "-c:v", "h264_mediacodec",
-                "-pix_fmt", "yuv420p",
-                "-b:v", bitrate.ToString(),
-                "-maxrate", bitrate.ToString(),
-                "-bufsize", (bitrate * 2).ToString()
-            ]);
-        }
+        args.AddRange([
+            "-vf", $"scale={outputWidth}:{outputHeight}:flags=fast_bilinear",
+            "-c:v", "h264_mediacodec",
+            "-pix_fmt", "yuv420p",
+            "-b:v", bitrate.ToString(),
+            "-maxrate", bitrate.ToString(),
+            "-bufsize", (bitrate * 2).ToString()
+        ]);
         args.AddRange([
             "-g", gopFrames.ToString(CultureInfo.InvariantCulture),
             "-an",
