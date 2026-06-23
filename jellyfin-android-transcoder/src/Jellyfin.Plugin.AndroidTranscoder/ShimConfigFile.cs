@@ -6,4 +6,5 @@ public sealed record ShimConfigFile(
     string Token,
     string RealFfmpegPath,
     string RealFfprobePath,
-    int MaxBitrate);
+    int MaxBitrate,
+    bool UseHardwareCodecs);

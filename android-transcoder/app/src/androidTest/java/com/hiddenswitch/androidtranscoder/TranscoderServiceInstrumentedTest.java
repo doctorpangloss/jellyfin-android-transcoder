@@ -47,6 +47,8 @@ public final class TranscoderServiceInstrumentedTest {
             context.startService(intent);
         }
         waitForStatus();
+        Thread.sleep(300);
+        waitForStatus();
     }
 
     @After
@@ -74,7 +76,6 @@ public final class TranscoderServiceInstrumentedTest {
 
         assertTrue(AppConfig.startOnBoot(context));
         assertTrue(AppConfig.keepAwake(context));
-        assertTrue(AppConfig.connectionJson(context).contains("\"startOnBoot\": true"));
         assertTrue(AppConfig.connectionJson(context).contains("\"keepAwake\": true"));
 
         Intent intent = new Intent(context, TranscoderService.class);
@@ -138,28 +139,84 @@ public final class TranscoderServiceInstrumentedTest {
 
     @Test
     public void testAuthorizedRemoteProcessEndpointAcceptsProcessRequest() throws Exception {
-        Map<String, String> headers = new HashMap<>();
-        headers.put("X-Remote-Executable", "ffmpeg");
-        headers.put("X-Remote-Args", Base64.getUrlEncoder().withoutPadding().encodeToString(("[\"-version\"]").getBytes(StandardCharsets.UTF_8)));
+        Map<String, String> headers = jsonHeaders();
         HttpResult result = request("POST",
                 "/api/v1/remoteprocesses",
                 "Bearer " + AppConfig.token(context),
                 headers,
-                new byte[0]);
+                "{\"executable\":\"ffmpeg\",\"args\":[\"-version\"]}".getBytes(StandardCharsets.UTF_8));
 
         assertEquals(200, result.status);
-        assertTrue(result.contentType, result.contentType.startsWith("multipart/mixed"));
-        assertTrue(result.body, result.body.contains("\"stdout\""));
-        assertTrue(result.body, result.body.contains("ffmpeg version"));
+        assertTrue(result.contentType, result.contentType.startsWith("application/json"));
+        assertTrue(result.body, result.body.contains("\"stdinUrl\""));
+        assertTrue(result.body, result.body.contains("\"filesUrl\""));
 
-        HttpResult status = request("GET", "/api/v1/status", null, null);
-        assertEquals(200, status.status);
-        assertTrue(status.body, status.body.contains("\"stdoutTail\""));
-        assertTrue(status.body, status.body.contains("ffmpeg version"));
+        String filesUrl = jsonString(result.body, "filesUrl");
+        HttpResult files = request("GET",
+                filesUrl,
+                "Bearer " + AppConfig.token(context),
+                null,
+                null);
+        assertEquals(200, files.status);
+        assertTrue(files.contentType, files.contentType.startsWith("multipart/mixed"));
+        assertTrue(files.body, files.body.contains("\"stdout\""));
+        assertTrue(files.body, files.body.contains("ffmpeg version"));
     }
 
     @Test
-    public void testCancelCurrentRemoteProcessEndpointIsIdempotentWhenIdle() throws Exception {
+    public void testRemoteProcessEndpointAcceptsParallelJellyfinJobs() throws Exception {
+        Map<String, String> headers = jsonHeaders();
+        byte[] requestBody = ("{\"executable\":\"ffmpeg\",\"args\":[\"-hide_banner\",\"-loglevel\",\"error\"," +
+                "\"-i\",\"{input}\",\"-f\",\"null\",\"-\"]}").getBytes(StandardCharsets.UTF_8);
+
+        HttpResult first = request("POST",
+                "/api/v1/remoteprocesses",
+                "Bearer " + AppConfig.token(context),
+                headers,
+                requestBody);
+        assertEquals(first.body, 200, first.status);
+
+        HttpResult second = request("POST",
+                "/api/v1/remoteprocesses",
+                "Bearer " + AppConfig.token(context),
+                headers,
+                requestBody);
+        assertEquals(second.body, 200, second.status);
+        assertTrue(second.body, second.body.contains("\"stdinUrl\""));
+        assertTrue(second.body, second.body.contains("\"filesUrl\""));
+
+        HttpResult status = request("GET", "/api/v1/status", null, null);
+        assertEquals(200, status.status);
+        assertTrue(status.body, status.body.contains("\"maxJobs\":255"));
+        assertTrue(status.body, status.body.contains("\"activeJobs\":2"));
+
+        String firstId = jsonString(first.body, "id");
+        String secondId = jsonString(second.body, "id");
+        HttpResult cancelFirst = request("DELETE",
+                "/api/v1/remoteprocesses/" + firstId,
+                "Bearer " + AppConfig.token(context),
+                null,
+                null);
+        assertEquals(cancelFirst.body, 200, cancelFirst.status);
+        assertTrue(cancelFirst.body, cancelFirst.body.contains("\"canceled\":true"));
+
+        HttpResult afterCancelOne = request("GET", "/api/v1/status", null, null);
+        assertEquals(200, afterCancelOne.status);
+        assertTrue(afterCancelOne.body, afterCancelOne.body.contains("\"activeJobs\":1"));
+        assertTrue(afterCancelOne.body, afterCancelOne.body.contains(secondId));
+        assertFalse(afterCancelOne.body, afterCancelOne.body.contains(firstId));
+
+        HttpResult cancelSecond = request("DELETE",
+                "/api/v1/remoteprocesses/" + secondId,
+                "Bearer " + AppConfig.token(context),
+                null,
+                null);
+        assertEquals(cancelSecond.body, 200, cancelSecond.status);
+        assertTrue(cancelSecond.body, cancelSecond.body.contains("\"canceled\":true"));
+    }
+
+    @Test
+    public void testCancelRemoteProcessEndpointIsByIdOnly() throws Exception {
         HttpResult result = request("DELETE",
                 "/api/v1/remoteprocesses/current",
                 "Bearer " + AppConfig.token(context),
@@ -167,8 +224,6 @@ public final class TranscoderServiceInstrumentedTest {
                 null);
 
         assertEquals(404, result.status);
-        assertTrue(result.body.contains("\"canceled\":false"));
-        assertTrue(result.body.contains("\"no active job\""));
     }
 
     @Test
@@ -178,8 +233,10 @@ public final class TranscoderServiceInstrumentedTest {
         assertTrue(dir.mkdirs());
         File finalSegment = new File(dir, "segment0.ts");
         File tempSegment = new File(dir, "segment1.ts.tmp");
+        File tempPlaylist = new File(dir, "stream.m3u8.tmp");
         assertTrue(finalSegment.createNewFile());
         assertTrue(tempSegment.createNewFile());
+        assertTrue(tempPlaylist.createNewFile());
 
         Method method = TranscoderService.class.getDeclaredMethod("listFiles", File.class);
         method.setAccessible(true);
@@ -187,6 +244,23 @@ public final class TranscoderServiceInstrumentedTest {
 
         assertTrue(files.contains(finalSegment));
         assertFalse(files.contains(tempSegment));
+        assertTrue(files.contains(tempPlaylist));
+    }
+
+    @Test
+    public void testProcessOutputCaptureIsBoundedForLongRunningFfmpegLogs() {
+        StringBuffer buffer = new StringBuffer();
+        int chunkLength = TranscoderService.androidLogChunkCharsForTest() * 4;
+        String chunk = repeat("x", chunkLength);
+
+        for (int i = 0; i < 64; i++) {
+            TranscoderService.appendProcessTextForTest(buffer, chunk, true);
+        }
+
+        assertTrue(buffer.length() <= TranscoderService.processTextTailCharsForTest());
+        assertEquals(
+                repeat("x", Math.min(TranscoderService.processTextTailCharsForTest(), chunkLength * 64)),
+                buffer.toString());
     }
 
     private void waitForStatus() throws Exception {
@@ -231,7 +305,9 @@ public final class TranscoderServiceInstrumentedTest {
         }
         if (body != null) {
             connection.setDoOutput(true);
-            connection.setRequestProperty("Content-Type", "video/x-matroska");
+            if (connection.getRequestProperty("Content-Type") == null) {
+                connection.setRequestProperty("Content-Type", "video/x-matroska");
+            }
             connection.setFixedLengthStreamingMode(body.length);
             try (OutputStream out = connection.getOutputStream()) {
                 out.write(body);
@@ -282,6 +358,34 @@ public final class TranscoderServiceInstrumentedTest {
         }
         int exit = process.waitFor();
         return new ExecResult(exit, stdout, stderr, new HashMap<>(builder.environment()));
+    }
+
+    private static String jsonString(String json, String name) {
+        String marker = "\"" + name + "\":\"";
+        int start = json.indexOf(marker);
+        if (start < 0) {
+            throw new AssertionError("Missing JSON string `" + name + "` in " + json);
+        }
+        start += marker.length();
+        int end = json.indexOf('"', start);
+        if (end < 0) {
+            throw new AssertionError("Unterminated JSON string `" + name + "` in " + json);
+        }
+        return json.substring(start, end).replace("\\/", "/");
+    }
+
+    private static String repeat(String value, int count) {
+        StringBuilder builder = new StringBuilder(value.length() * count);
+        for (int i = 0; i < count; i++) {
+            builder.append(value);
+        }
+        return builder.toString();
+    }
+
+    private static Map<String, String> jsonHeaders() {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Content-Type", "application/json");
+        return headers;
     }
 
     private static final class ExecResult {

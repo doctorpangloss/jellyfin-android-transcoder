@@ -27,18 +27,16 @@ final class AppConfig {
     static String token(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         String existing = prefs.getString(TOKEN, null);
-        if (existing != null && !existing.isEmpty()) {
+        if (isShortCode(existing)) {
             return existing;
         }
-        byte[] bytes = new byte[24];
-        new SecureRandom().nextBytes(bytes);
-        String token = toHex(bytes);
+        String token = String.format("%04d", new SecureRandom().nextInt(10000));
         prefs.edit().putString(TOKEN, token).apply();
         return token;
     }
 
     static void setToken(Context context, String token) {
-        if (token == null || token.isEmpty()) {
+        if (!isShortCode(token)) {
             return;
         }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -49,7 +47,7 @@ final class AppConfig {
 
     static boolean startOnBoot(Context context) {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getBoolean(START_ON_BOOT, false);
+                .getBoolean(START_ON_BOOT, true);
     }
 
     static void setStartOnBoot(Context context, boolean enabled) {
@@ -102,7 +100,7 @@ final class AppConfig {
             for (String url : baseUrls()) {
                 urls.put(url);
             }
-            obj.put("name", "HiddenSwitch Android Transcoder");
+            obj.put("name", "Android Transcoder");
             obj.put("baseUrl", urls.length() > 0 ? urls.getString(0) : "http://PHONE_IP:" + PORT);
             obj.put("allBaseUrls", urls);
             obj.put("token", token(context));
@@ -110,7 +108,6 @@ final class AppConfig {
             obj.put("targetCodec", "h264");
             obj.put("targetWidth", 1920);
             obj.put("targetHeight", 1080);
-            obj.put("startOnBoot", startOnBoot(context));
             obj.put("keepAwake", keepAwake(context));
             return obj.toString(2);
         } catch (Exception ex) {
@@ -118,14 +115,7 @@ final class AppConfig {
         }
     }
 
-    private static String toHex(byte[] bytes) {
-        char[] chars = new char[bytes.length * 2];
-        char[] alphabet = "0123456789abcdef".toCharArray();
-        for (int i = 0; i < bytes.length; i++) {
-            int v = bytes[i] & 0xff;
-            chars[i * 2] = alphabet[v >>> 4];
-            chars[i * 2 + 1] = alphabet[v & 0x0f];
-        }
-        return new String(chars);
+    private static boolean isShortCode(String token) {
+        return token != null && token.matches("[0-9]{4}");
     }
 }

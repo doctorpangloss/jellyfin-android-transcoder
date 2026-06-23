@@ -3,8 +3,10 @@ using System.Globalization;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Text;
+using System.Runtime.InteropServices;
 
 namespace JellyfinAndroidTranscoder.Shim;
 
@@ -32,9 +34,9 @@ public static class Program
 
             Console.Error.WriteLine($"jfat: routing {probe.CodecName}/{probe.PixelFormat} through {config.AndroidBaseUrl}");
             var remoteExit = await AndroidTranscode.Run(config, command, probe);
-            if (remoteExit == 0)
+            if (remoteExit == 0 || IsForwardedProcessSignalExit(remoteExit))
             {
-                return 0;
+                return remoteExit;
             }
 
             Console.Error.WriteLine($"jfat: fallback after android ffmpeg exited {remoteExit}");
@@ -46,6 +48,9 @@ public static class Program
             return await ProcessUtil.Run(config.RealFfmpegPath, args);
         }
     }
+
+    private static bool IsForwardedProcessSignalExit(int exitCode) =>
+        exitCode is 129 or 130 or 131 or 143;
 }
 
 public sealed record ShimConfig(
@@ -54,7 +59,8 @@ public sealed record ShimConfig(
     string Token,
     string RealFfmpegPath,
     string RealFfprobePath,
-    int MaxBitrate)
+    int MaxBitrate,
+    bool? UseHardwareCodecs)
 {
     public static ShimConfig Load()
     {
@@ -66,13 +72,15 @@ public sealed record ShimConfig(
         if (!File.Exists(path))
         {
             return new ShimConfig(false, "", "", "/usr/lib/jellyfin-ffmpeg/ffmpeg",
-                "/usr/lib/jellyfin-ffmpeg/ffprobe", 6_000_000);
+                "/usr/lib/jellyfin-ffmpeg/ffprobe", 6_000_000, true);
         }
 
         var json = JsonSerializer.Deserialize<ShimConfig>(File.ReadAllText(path),
             new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         return json ?? throw new InvalidOperationException($"Invalid config: {path}");
     }
+
+    public bool HardwareCodecsEnabled => UseHardwareCodecs != false;
 
     private static string FirstExisting(params string[] paths) =>
         paths.FirstOrDefault(File.Exists) ?? paths[0];
@@ -83,6 +91,7 @@ public sealed class FfmpegCommand
     public required IReadOnlyList<string> Args { get; init; }
     public string? InputPath { get; init; }
     public string? OutputPath { get; init; }
+    public string? SeekBeforeInput { get; init; }
     public int MaxRate { get; init; }
     public int BufSize { get; init; }
     public int Height { get; init; }
@@ -106,7 +115,8 @@ public sealed class FfmpegCommand
 
     public static FfmpegCommand Parse(IReadOnlyList<string> args)
     {
-        var input = ValueAfter(args, "-i")?.Trim();
+        var inputIndex = IndexOf(args, "-i");
+        var input = inputIndex >= 0 && inputIndex + 1 < args.Count ? args[inputIndex + 1].Trim() : null;
         if (input is not null && input.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
         {
             input = input[5..];
@@ -125,6 +135,7 @@ public sealed class FfmpegCommand
             Args = args.ToArray(),
             InputPath = string.IsNullOrWhiteSpace(input) ? null : input,
             OutputPath = output,
+            SeekBeforeInput = ValueBefore(args, "-ss", inputIndex),
             MaxRate = ParseBitrate(ValueAfter(args, "-maxrate"), 6_000_000),
             BufSize = ParseBitrate(ValueAfter(args, "-bufsize"), 12_000_000),
             Width = scaleWidth ?? 1920,
@@ -157,6 +168,22 @@ public sealed class FfmpegCommand
             }
         }
         return -1;
+    }
+
+    private static string? ValueBefore(IReadOnlyList<string> args, string key, int beforeIndex)
+    {
+        if (beforeIndex <= 0)
+        {
+            return null;
+        }
+        for (var i = 0; i < beforeIndex - 1; i++)
+        {
+            if (args[i] == key)
+            {
+                return args[i + 1];
+            }
+        }
+        return null;
     }
 
     private static int ParseBitrate(string? value, int fallback)
@@ -400,11 +427,16 @@ public static class AndroidTranscode
     private static async Task<int> RunOnce(ShimConfig config, FfmpegCommand command, MediaProbe probe)
     {
         using var startupTimeout = new CancellationTokenSource(RemoteStartupTimeout);
+        using var remoteStop = new CancellationTokenSource();
+        using var remoteIo = CancellationTokenSource.CreateLinkedTokenSource(startupTimeout.Token, remoteStop.Token);
         using var controlClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         using var uploadClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         using var filesClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         var baseUri = config.AndroidBaseUrl.TrimEnd('/');
-        var job = await StartRemoteProcess(controlClient, baseUri, config.Token, EncodeRemoteArgs(BuildRemoteFfmpegArgs(config, command, probe)), startupTimeout.Token);
+        var job = await StartRemoteProcess(controlClient, baseUri, config.Token, BuildRemoteFfmpegArgs(config, command, probe), startupTimeout.Token);
+        var stopRequest = new TaskCompletionSource<ProcessStopRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stdinControlTask = WaitForFfmpegQuitCommand(stopRequest, remoteStop.Token);
+        using var signalHandlers = RegisterProcessSignalHandlers(stopRequest);
 
         await using var input = File.OpenRead(command.InputPath!);
         await using var limitedInput = new RateLimitedReadStream(input, RemoteInputBytesPerSecond);
@@ -412,34 +444,166 @@ public static class AndroidTranscode
         stdinRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
         stdinRequest.Content = new StreamContent(limitedInput);
         stdinRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        var stdinTask = uploadClient.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead);
+        var stdinTask = uploadClient.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead, remoteIo.Token);
 
-        using var filesRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.FilesUrl);
-        filesRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
-        using var filesResponse = await filesClient.SendAsync(filesRequest, HttpCompletionOption.ResponseHeadersRead, startupTimeout.Token);
-        filesResponse.EnsureSuccessStatusCode();
-        var boundary = MultipartUtil.GetBoundary(filesResponse.Content.Headers.ContentType?.ToString()
-            ?? throw new InvalidOperationException("Missing multipart content type"));
-        await using (var files = await filesResponse.Content.ReadAsStreamAsync(startupTimeout.Token))
+        try
         {
-            var exit = await MultipartUtil.MaterializeFiles(files, boundary, command);
-            using var stdinResponse = await stdinTask;
-            stdinResponse.EnsureSuccessStatusCode();
-            return exit;
+            using var filesRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.FilesUrl);
+            filesRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
+            var filesResponseTask = filesClient.SendAsync(filesRequest, HttpCompletionOption.ResponseHeadersRead, remoteIo.Token);
+            if (await Task.WhenAny(filesResponseTask, stopRequest.Task) == stopRequest.Task)
+            {
+                return await StopRemoteProcess(controlClient, baseUri, config.Token, job.Id, remoteStop, await stopRequest.Task);
+            }
+            using var filesResponse = await filesResponseTask;
+            filesResponse.EnsureSuccessStatusCode();
+            var boundary = MultipartUtil.GetBoundary(filesResponse.Content.Headers.ContentType?.ToString()
+                ?? throw new InvalidOperationException("Missing multipart content type"));
+            await using (var files = await filesResponse.Content.ReadAsStreamAsync(startupTimeout.Token))
+            {
+                var materializeTask = MultipartUtil.MaterializeFiles(files, boundary, command);
+                if (await Task.WhenAny(materializeTask, stopRequest.Task) == stopRequest.Task)
+                {
+                    return await StopRemoteProcess(controlClient, baseUri, config.Token, job.Id, remoteStop, await stopRequest.Task);
+                }
+                var exit = await materializeTask;
+                using var stdinResponse = await stdinTask;
+                stdinResponse.EnsureSuccessStatusCode();
+                return exit;
+            }
+        }
+        catch
+        {
+            await CancelRemoteProcess(controlClient, baseUri, config.Token, job.Id);
+            throw;
+        }
+        finally
+        {
+            remoteStop.Cancel();
         }
     }
 
-    private static async Task<RemoteJob> StartRemoteProcess(HttpClient client, string baseUri, string token, string remoteArgs, CancellationToken cancellationToken)
+    private static async Task WaitForFfmpegQuitCommand(TaskCompletionSource<ProcessStopRequest> stopRequest, CancellationToken cancellationToken)
+    {
+        await Task.Run(() =>
+        {
+            try
+            {
+                var debug = Environment.GetEnvironmentVariable("JFAT_DEBUG_STDIN") == "1";
+                if (debug)
+                {
+                    Console.Error.WriteLine($"jfat: stdin redirected={Console.IsInputRedirected}");
+                }
+                if (!Console.IsInputRedirected)
+                {
+                    return;
+                }
+                using var stdin = Console.OpenStandardInput();
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var value = stdin.ReadByte();
+                    if (value < 0)
+                    {
+                        return;
+                    }
+                    if (value == 'q')
+                    {
+                        if (debug)
+                        {
+                            Console.Error.WriteLine("jfat: stdin received q");
+                        }
+                        stopRequest.TrySetResult(new ProcessStopRequest("stdin-q", 0));
+                        return;
+                    }
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }, CancellationToken.None);
+    }
+
+    private static IDisposable RegisterProcessSignalHandlers(TaskCompletionSource<ProcessStopRequest> stopRequest)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Console.CancelKeyPress += OnCancelKeyPress;
+            return new DelegateDisposable(() => Console.CancelKeyPress -= OnCancelKeyPress);
+        }
+
+        var registrations = new List<IDisposable>
+        {
+            PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+            {
+                ctx.Cancel = true;
+                stopRequest.TrySetResult(new ProcessStopRequest("SIGTERM", 143));
+            }),
+            PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx =>
+            {
+                ctx.Cancel = true;
+                stopRequest.TrySetResult(new ProcessStopRequest("SIGINT", 130));
+            }),
+            PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx =>
+            {
+                ctx.Cancel = true;
+                stopRequest.TrySetResult(new ProcessStopRequest("SIGHUP", 129));
+            }),
+            PosixSignalRegistration.Create(PosixSignal.SIGQUIT, ctx =>
+            {
+                ctx.Cancel = true;
+                stopRequest.TrySetResult(new ProcessStopRequest("SIGQUIT", 131));
+            })
+        };
+        return new DelegateDisposable(() =>
+        {
+            foreach (var registration in registrations)
+            {
+                registration.Dispose();
+            }
+        });
+
+        void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs args)
+        {
+            args.Cancel = true;
+            stopRequest.TrySetResult(new ProcessStopRequest("CTRL", 130));
+        }
+    }
+
+    private static async Task<int> StopRemoteProcess(HttpClient controlClient, string baseUri, string token, string jobId, CancellationTokenSource remoteStop, ProcessStopRequest request)
+    {
+        Console.Error.WriteLine($"jfat: stopping remote job {jobId} after {request.Reason}");
+        remoteStop.Cancel();
+        await CancelRemoteProcess(controlClient, baseUri, token, jobId);
+        return request.ExitCode;
+    }
+
+    private static async Task<RemoteJob> StartRemoteProcess(HttpClient client, string baseUri, string token, IReadOnlyList<string> remoteArgs, CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, baseUri + "/api/v1/remoteprocesses");
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.TryAddWithoutValidation("X-Remote-Split", "1");
-        request.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
-        request.Headers.TryAddWithoutValidation("X-Remote-Args", remoteArgs);
+        request.Content = JsonContent.Create(new RemoteProcessRequest("ffmpeg", remoteArgs));
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
         var job = await response.Content.ReadFromJsonAsync<RemoteJob>(cancellationToken);
         return job ?? throw new InvalidOperationException("Android did not return a remote job.");
+    }
+
+    private static async Task CancelRemoteProcess(HttpClient client, string baseUri, string token, string jobId)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Delete, baseUri + "/api/v1/remoteprocesses/" + Uri.EscapeDataString(jobId));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+        }
+        catch
+        {
+            // Best-effort cleanup so the next Jellyfin segment invocation can start.
+        }
     }
 
     private static IReadOnlyList<string> BuildRemoteFfmpegArgs(ShimConfig config, FfmpegCommand command, MediaProbe probe)
@@ -447,49 +611,78 @@ public static class AndroidTranscode
         var toneMap = probe.IsHdr ? 1 : 0;
         var bitrate = Math.Min(command.MaxRate, config.MaxBitrate);
         var (outputWidth, outputHeight) = OutputDimensions(command, probe);
-        const int startupSegmentSeconds = 1;
+        var hlsTime = command.ValueAfter("-hls_time") ?? command.GopSeconds.ToString(CultureInfo.InvariantCulture);
+        var hlsSeconds = ParsePositiveDouble(hlsTime, command.GopSeconds);
+        var gopFrames = Math.Max(1, (int)Math.Round(hlsSeconds * 24));
         var outputName = Path.GetFileName(command.OutputPath!);
         var segmentName = Path.GetFileName(command.HlsSegmentFilename ?? Path.ChangeExtension(command.OutputPath!, ".ts"));
         var hlsSegmentType = string.Equals(command.ValueAfter("-hls_segment_type"), "fmp4", StringComparison.OrdinalIgnoreCase)
             ? "fmp4"
             : "mpegts";
+        var useHardwareFrames = config.HardwareCodecsEnabled && string.IsNullOrWhiteSpace(command.SeekBeforeInput);
         var args = new List<string>
         {
             "-hide_banner",
-            "-loglevel", "warning",
-            "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
-            "-hwaccel", "mediacodec",
-            "-hwaccel_device", "mc",
-            "-hwaccel_output_format", "mediacodec"
+            "-loglevel", "warning"
         };
+        if (useHardwareFrames)
+        {
+            args.AddRange([
+                "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
+                "-hwaccel", "mediacodec",
+                "-hwaccel_device", "mc",
+                "-hwaccel_output_format", "mediacodec"
+            ]);
+        }
         if (probe.DurationSeconds > 0)
         {
             args.Add("-t");
             args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
         }
         args.AddRange(["-i", "{input}"]);
+        if (!string.IsNullOrWhiteSpace(command.SeekBeforeInput))
+        {
+            args.Add("-ss");
+            args.Add(command.SeekBeforeInput);
+        }
         if (probe.DurationSeconds > 0)
         {
             args.Add("-t");
             args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
         }
+        args.AddRange(["-map", "0:v:0"]);
+        if (useHardwareFrames)
+        {
+            args.AddRange([
+                "-c:v", "h264_mediacodec",
+                "-pix_fmt", "mediacodec",
+                "-output_width", outputWidth.ToString(),
+                "-output_height", outputHeight.ToString(),
+                "-surface_tonemap", toneMap.ToString(),
+                "-b:v", bitrate.ToString(),
+                "-maxrate", bitrate.ToString(),
+                "-bufsize", (bitrate * 2).ToString(),
+                "-bitrate_mode", "cbr"
+            ]);
+        }
+        else
+        {
+            args.AddRange([
+                "-vf", $"scale={outputWidth}:{outputHeight}:flags=fast_bilinear",
+                "-c:v", "h264_mediacodec",
+                "-pix_fmt", "yuv420p",
+                "-b:v", bitrate.ToString(),
+                "-maxrate", bitrate.ToString(),
+                "-bufsize", (bitrate * 2).ToString()
+            ]);
+        }
         args.AddRange([
-            "-map", "0:v:0",
-            "-c:v", "h264_mediacodec",
-            "-pix_fmt", "mediacodec",
-            "-output_width", outputWidth.ToString(),
-            "-output_height", outputHeight.ToString(),
-            "-surface_tonemap", toneMap.ToString(),
-            "-b:v", bitrate.ToString(),
-            "-maxrate", bitrate.ToString(),
-            "-bufsize", (bitrate * 2).ToString(),
-            "-bitrate_mode", "cbr",
-            "-g", "24",
+            "-g", gopFrames.ToString(CultureInfo.InvariantCulture),
             "-an",
             "-sn",
             "-dn",
             "-f", "hls",
-            "-hls_time", startupSegmentSeconds.ToString(),
+            "-hls_time", hlsTime,
             "-hls_flags", HlsFlagsWithTempFile(command),
             "-hls_segment_type", hlsSegmentType,
             "-hls_segment_filename", "{outputRoot}/" + segmentName
@@ -504,6 +697,13 @@ public static class AndroidTranscode
         AddPreservedOption(args, command, "-hls_list_size");
         args.AddRange(["-y", "{outputRoot}/" + outputName]);
         return args;
+    }
+
+    private static double ParsePositiveDouble(string value, double fallback)
+    {
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) && parsed > 0
+            ? parsed
+            : fallback;
     }
 
     private static string HlsFlagsWithTempFile(FfmpegCommand command)
@@ -563,7 +763,17 @@ public static class AndroidTranscode
 
 }
 
+public sealed record RemoteProcessRequest(
+    [property: JsonPropertyName("executable")] string Executable,
+    [property: JsonPropertyName("args")] IReadOnlyList<string> Args);
 public sealed record RemoteJob(string Id, string StdinUrl, string FilesUrl);
+
+public sealed record ProcessStopRequest(string Reason, int ExitCode);
+
+public sealed class DelegateDisposable(Action dispose) : IDisposable
+{
+    public void Dispose() => dispose();
+}
 
 public sealed class RateLimitedReadStream : Stream
 {
@@ -704,6 +914,10 @@ public static class MultipartUtil
                 }
                 continue;
             }
+            if (string.Equals(remoteEvent, "ready", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
 
             var remotePath = Header(headers, "x-remote-path")
                 ?? throw new InvalidOperationException("Missing X-Remote-Path");
@@ -719,6 +933,10 @@ public static class MultipartUtil
     private static string ResolveLocalPath(string outputDirectory, string remotePath)
     {
         var fileName = Path.GetFileName(remotePath.Replace('\\', '/'));
+        if (fileName.EndsWith(".m3u8.tmp", StringComparison.OrdinalIgnoreCase))
+        {
+            fileName = fileName[..^4];
+        }
         return Path.Combine(outputDirectory, fileName);
     }
 
@@ -759,13 +977,15 @@ public static class MultipartUtil
     private static async Task<string?> ReadLine(Stream stream)
     {
         using var bytes = new MemoryStream();
+        var buffer = new byte[1];
         while (true)
         {
-            var value = stream.ReadByte();
-            if (value < 0)
+            var read = await stream.ReadAsync(buffer.AsMemory(0, 1));
+            if (read == 0)
             {
                 return bytes.Length == 0 ? null : Encoding.ASCII.GetString(bytes.ToArray());
             }
+            var value = buffer[0];
             if (value == '\n')
             {
                 var line = bytes.ToArray();

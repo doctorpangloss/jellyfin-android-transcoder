@@ -18,6 +18,8 @@ public sealed class PluginConfiguration : BasePluginConfiguration
 
     public int MaxBitrate { get; set; } = 6_000_000;
 
+    public bool UseHardwareCodecs { get; set; } = true;
+
     public string PairingCode { get; set; } = string.Empty;
 
     public DateTime PairingCodeExpiresUtc { get; set; }

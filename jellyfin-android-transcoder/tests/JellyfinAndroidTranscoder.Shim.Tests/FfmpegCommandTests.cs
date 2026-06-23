@@ -88,6 +88,28 @@ public sealed class FfmpegCommandTests
     }
 
     [Fact]
+    public void ParsesJellyfinFollowupSegmentSeekBeforeInput()
+    {
+        string[] args =
+        [
+            "-analyzeduration", "200M", "-probesize", "1G", "-ss", "00:00:33.000", "-i",
+            "file:/media/movies/Inception (2010)/Inception (2010) Remux-2160p.mkv",
+            "-codec:v:0", "libx264", "-force_key_frames:0", "expr:gte(t,n_forced*3)",
+            "-vf", @"scale=trunc(min(max(iw\,ih*a)\,960)/2)*2:trunc(ow/a/2)*2",
+            "-f", "hls", "-hls_time", "3", "-start_number", "11",
+            "-hls_segment_filename", "/cache/transcodes/id%d.ts",
+            "-hls_playlist_type", "vod", "-hls_list_size", "0",
+            "-y", "/cache/transcodes/id.m3u8"
+        ];
+
+        var command = FfmpegCommand.Parse(args);
+
+        Assert.True(command.CanConsiderRouting);
+        Assert.Equal("00:00:33.000", command.SeekBeforeInput);
+        Assert.Equal("11", command.ValueAfter("-start_number"));
+    }
+
+    [Fact]
     public void RoutesHevcAndAv1Only()
     {
         var path = Path.GetTempFileName();

@@ -18,7 +18,7 @@ The Android service exposes:
 
 - `GET /api/v1/status`
 - `POST /api/v1/remoteprocesses`
-- `DELETE /api/v1/remoteprocesses/current`
+- `DELETE /api/v1/remoteprocesses/{id}`
 
 The remote process endpoint starts bundled patched FFmpeg, streams input into FFmpeg stdin, and streams completed HLS files back to the shim as `multipart/mixed`. Unsupported Jellyfin commands fall back to the configured real FFmpeg path.
 
@@ -35,12 +35,13 @@ The Android service automatically kills and reaps a job when:
 To manually clear a stuck job:
 
 ```bash
+JOB_ID=<id-from-status>
 curl -X DELETE \
   -H "Authorization: Bearer <token>" \
-  http://PHONE_IP:8098/api/v1/remoteprocesses/current
+  "http://PHONE_IP:8098/api/v1/remoteprocesses/$JOB_ID"
 ```
 
-The endpoint is safe to call when idle; it returns `404` with `{"canceled":false,...}` if there is no active job.
+The endpoint returns `404` with `{"canceled":false,...}` if the job id no longer exists.
 
 ## Release Assets
 

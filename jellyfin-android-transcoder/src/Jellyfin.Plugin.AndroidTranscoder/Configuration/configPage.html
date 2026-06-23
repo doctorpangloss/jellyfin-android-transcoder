@@ -20,6 +20,12 @@
                         <span>Enable Android routing</span>
                     </label>
                 </div>
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="chkHardware" />
+                        <span>Use Android hardware codecs</span>
+                    </label>
+                </div>
                 <div class="inputContainer">
                     <label class="inputLabel inputLabelUnfocused" for="txtBaseUrl">Android base URL</label>
                     <input is="emby-input" id="txtBaseUrl" type="text" />
@@ -69,6 +75,7 @@
         async function load() {
             const c = await api.getJSON(api.getUrl('AndroidTranscoder/Configuration'));
             page.querySelector('#chkEnabled').checked = !!c.Enabled;
+            page.querySelector('#chkHardware').checked = c.UseHardwareCodecs !== false;
             page.querySelector('#txtBaseUrl').value = c.AndroidBaseUrl || '';
             page.querySelector('#txtToken').value = c.Token || '';
             page.querySelector('#txtMaxBitrate').value = c.MaxBitrate || 6000000;
@@ -79,6 +86,7 @@
         function readConfig() {
             return {
                 Enabled: page.querySelector('#chkEnabled').checked,
+                UseHardwareCodecs: page.querySelector('#chkHardware').checked,
                 AndroidBaseUrl: page.querySelector('#txtBaseUrl').value,
                 Token: page.querySelector('#txtToken').value,
                 MaxBitrate: parseInt(page.querySelector('#txtMaxBitrate').value || '6000000', 10),

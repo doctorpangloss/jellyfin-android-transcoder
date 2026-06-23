@@ -64,7 +64,7 @@ build_one() {
     --enable-demuxer='matroska,mov,mpegts' \
     --enable-muxer='hls,mpegts,null,mp4,matroska' \
     --enable-parser='hevc,h264' \
-    --enable-bsf='hevc_mp4toannexb,h264_mp4toannexb,extract_extradata' \
+    --enable-bsf='hevc_mp4toannexb,h264_mp4toannexb,extract_extradata,h264_metadata,hevc_metadata' \
     --enable-decoder='hevc,hevc_mediacodec,h264,h264_mediacodec' \
     --enable-encoder='hevc_mediacodec,h264_mediacodec' \
     --enable-filter='null,format,scale' \
@@ -75,6 +75,7 @@ build_one() {
     --extra-ldflags='-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -landroid -lmediandk -llog -lEGL -lGLESv2' \
     $extra_configure
 
+  mkdir -p fftools/resources
   PATH="$TOOLCHAIN/bin:$PATH" make -j"$JOBS" ffmpeg
   PATH="$TOOLCHAIN/bin:$PATH" llvm-strip ffmpeg
   install -m 0755 ffmpeg "$OUT_DIR/$abi/libffmpeg.so"

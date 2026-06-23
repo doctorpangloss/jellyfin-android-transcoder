@@ -68,8 +68,8 @@ JSON
         Assert.Contains("{outputRoot}/segment.m3u8", request.RemoteArgs);
         Assert.Contains("\"-output_width\",\"320\"", request.RemoteArgs);
         Assert.Contains("\"-output_height\",\"180\"", request.RemoteArgs);
-        Assert.Contains("\"-g\",\"24\"", request.RemoteArgs);
-        Assert.Contains("\"-hls_time\",\"1\"", request.RemoteArgs);
+        Assert.Contains("\"-g\",\"72\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_time\",\"3\"", request.RemoteArgs);
         Assert.Contains("\"-hls_flags\",\"temp_file\"", request.RemoteArgs);
         Assert.Contains("\"-hls_segment_type\",\"fmp4\"", request.RemoteArgs);
         Assert.Contains("\"-hls_playlist_type\",\"vod\"", request.RemoteArgs);
@@ -131,6 +131,170 @@ JSON
     }
 
     [Fact]
+    public async Task RemoteTempPlaylistIsMaterializedAtJellyfinPlaylistPath()
+    {
+        var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":320,"height":180,"bit_rate":"6000000","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709"}],"format":{"duration":"60"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "temp-playlist-ffmpeg.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("streaming-input-", 1024)));
+        var output = Path.Combine(_tempDir, "playlist.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["playlist.m3u8.tmp"] = "#EXTM3U\n#EXT-X-MAP:URI=\"playlist-1.mp4\"\n#EXTINF:1.000,\nplaylist0.mp4\n"u8.ToArray(),
+            ["playlist-1.mp4"] = "fmp4-init"u8.ToArray(),
+            ["playlist0.mp4"] = "fmp4-media"u8.ToArray()
+        });
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main(JellyfinArgs(input, output));
+
+        Assert.Equal(0, exitCode);
+        Assert.True(File.Exists(output), "The shim must expose FFmpeg's temp playlist at Jellyfin's requested .m3u8 path.");
+        Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
+        Assert.False(File.Exists(output + ".tmp"), "The temp playlist name is an FFmpeg implementation detail and must not leak to Jellyfin.");
+    }
+
+    [Fact]
+    public async Task JellyfinStopCommandCancelsRemoteJobById()
+    {
+        var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "q-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("streaming-input-", 1024 * 1024)));
+        var output = Path.Combine(_tempDir, "playlist.m3u8");
+
+        await using var android = await MockAndroidService.Start(
+            new Dictionary<string, byte[]>(),
+            holdFilesStreamOpen: true);
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var shimExecutable = await BuildShimExecutable();
+        using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
+        var stderr = process.StandardError.ReadToEndAsync();
+        await android.WaitForFilesStream();
+        await process.StandardInput.WriteLineAsync("q");
+        await process.StandardInput.FlushAsync();
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (TaskCanceledException ex)
+        {
+            process.Kill(entireProcessTree: true);
+            throw new TimeoutException(
+                $"Shim did not exit after stdin q; stderr: {await stderr}; deletes: {string.Join(",", android.DeletePaths)}",
+                ex);
+        }
+
+        Assert.True(
+            android.DeletePaths.Contains("/api/v1/remoteprocesses/job-1"),
+            $"Expected shim to cancel job-1 after stdin q; stderr: {await stderr}; fallback log: {await File.ReadAllTextAsync(ffmpegLog)}; deletes: {string.Join(",", android.DeletePaths)}");
+        Assert.DoesNotContain("/api/v1/remoteprocesses/current", android.DeletePaths);
+        Assert.True(
+            process.ExitCode == 0 || process.ExitCode == 255,
+            $"Unexpected shim exit code {process.ExitCode}; fallback log: {await File.ReadAllTextAsync(ffmpegLog)}; deletes: {string.Join(",", android.DeletePaths)}");
+    }
+
+    [Fact]
+    public async Task JellyfinTerminateSignalCancelsRemoteJobByIdAndDoesNotFallback()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var ffmpeg = WriteExecutable("fake-ffmpeg-signal.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe-signal.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "signal-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie-signal.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("streaming-input-", 1024 * 1024)));
+        var output = Path.Combine(_tempDir, "playlist-signal.m3u8");
+
+        await using var android = await MockAndroidService.Start(
+            new Dictionary<string, byte[]>(),
+            holdFilesStreamOpen: true);
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var shimExecutable = await BuildShimExecutable();
+        using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
+        var stderr = process.StandardError.ReadToEndAsync();
+        await android.WaitForFilesStream();
+
+        using (var kill = Process.Start("kill", ["-TERM", process.Id.ToString()])!)
+        {
+            await kill.WaitForExitAsync();
+            Assert.Equal(0, kill.ExitCode);
+        }
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (TaskCanceledException ex)
+        {
+            process.Kill(entireProcessTree: true);
+            throw new TimeoutException(
+                $"Shim did not exit after SIGTERM; stderr: {await stderr}; deletes: {string.Join(",", android.DeletePaths)}",
+                ex);
+        }
+
+        Assert.True(
+            android.DeletePaths.Contains("/api/v1/remoteprocesses/job-1"),
+            $"Expected shim to cancel job-1 after SIGTERM; stderr: {await stderr}; fallback log: {await File.ReadAllTextAsync(ffmpegLog)}; deletes: {string.Join(",", android.DeletePaths)}");
+        Assert.DoesNotContain("/api/v1/remoteprocesses/current", android.DeletePaths);
+        Assert.Equal(143, process.ExitCode);
+        Assert.Equal("", await File.ReadAllTextAsync(ffmpegLog));
+    }
+
+    [Fact]
     public async Task InceptionSafariCommandRoutesAsFmp4At1080pSixMegabit()
     {
         var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
@@ -189,6 +353,62 @@ JSON
     }
 
     [Fact]
+    public async Task JellyfinFollowupSegmentSeekIsForwardedBeforeRemoteInput()
+    {
+        var ffmpeg = WriteExecutable("fake-ffmpeg-seek.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 99
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe-seek.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p","width":320,"height":180,"bit_rate":"2500000","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709"}],"format":{"duration":"3600"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "seek-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("seek-window-input-", 4096)));
+        var output = Path.Combine(_tempDir, "seek.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["seek11.ts"] = "seek-media"u8.ToArray(),
+            ["seek.m3u8"] = "#EXTM3U\n#EXTINF:3.000,\nseek11.ts\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 600_000);
+
+        var exitCode = await Program.Main([
+            "-analyzeduration", "200M", "-probesize", "1G", "-ss", "00:00:33.000", "-i", $"file:{input}",
+            "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+            "-map", "0:0", "-map", "-0:a", "-map", "-0:s",
+            "-codec:v:0", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-maxrate", "472000", "-bufsize", "944000",
+            "-force_key_frames:0", "expr:gte(t,n_forced*3)", "-sc_threshold:v:0", "0",
+            "-vf", @"scale=trunc(min(max(iw\,ih*a)\,960)/2)*2:trunc(ow/a/2)*2,format=yuv420p",
+            "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
+            "-f", "hls", "-max_delay", "5000000", "-hls_time", "3", "-hls_segment_type", "mpegts",
+            "-start_number", "11", "-hls_segment_filename", Path.Combine(_tempDir, "seek%d.ts"),
+            "-hls_playlist_type", "vod", "-hls_list_size", "0", "-y", output
+        ]);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", await File.ReadAllTextAsync(ffmpegLog));
+        var request = await android.GetSingleRequest();
+        Assert.Contains("\"-i\",\"{input}\",\"-ss\",\"00:00:33.000\"", request.RemoteArgs);
+        Assert.Contains("\"-start_number\",\"11\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_time\",\"3\"", request.RemoteArgs);
+        Assert.Contains("\"-g\",\"72\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hwaccel\",\"mediacodec\"", request.RemoteArgs);
+        Assert.Contains("\"-c:v\",\"h264_mediacodec\"", request.RemoteArgs);
+    }
+
+    [Fact]
     public async Task RemoteHttpFailureRetriesAndroidBeforeLocalFallback()
     {
         var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
@@ -234,6 +454,42 @@ JSON
         Assert.Equal(2, android.RequestCount);
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
         Assert.Equal("fmp4-media-after-retry", await File.ReadAllTextAsync(Path.Combine(_tempDir, "retry0.mp4")));
+    }
+
+    [Fact]
+    public async Task FailedJellyfinWindowCancelsOnlyItsOwnRemoteJob()
+    {
+        var ffmpeg = WriteExecutable("fake-ffmpeg.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+exit 42
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "cancel-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("overlap-window-input-", 4096)));
+        var output = Path.Combine(_tempDir, "cancel.m3u8");
+
+        await using var android = await MockAndroidService.Start(
+            new Dictionary<string, byte[]>(),
+            failFilesStream: true);
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main(InceptionSafariArgs(input, output));
+
+        Assert.Equal(42, exitCode);
+        Assert.Contains("/api/v1/remoteprocesses/job-1", android.DeletePaths);
+        Assert.DoesNotContain("/api/v1/remoteprocesses/current", android.DeletePaths);
     }
 
     [Fact]
@@ -400,6 +656,22 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
         }
     }
 
+    private static Process StartShimForControlTest(string shimExecutable, IEnumerable<string> args)
+    {
+        var start = new ProcessStartInfo(shimExecutable)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        foreach (var arg in args)
+        {
+            start.ArgumentList.Add(arg);
+        }
+
+        return Process.Start(start) ?? throw new InvalidOperationException($"Failed to start {shimExecutable}");
+    }
+
     private static string RepositoryRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
@@ -420,15 +692,21 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
         private readonly HttpListener _listener;
         private readonly IReadOnlyDictionary<string, byte[]> _files;
         private readonly bool _failFirstRemoteRequest;
+        private readonly bool _failFilesStream;
+        private readonly bool _holdFilesStreamOpen;
         private readonly List<AndroidRequest> _requests = [];
+        private readonly List<string> _deletePaths = [];
+        private readonly TaskCompletionSource _filesStreamStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly Task _serverTask;
 
-        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest)
+        private MockAndroidService(HttpListener listener, string baseUrl, IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest, bool failFilesStream, bool holdFilesStreamOpen)
         {
             _listener = listener;
             BaseUrl = baseUrl;
             _files = files;
             _failFirstRemoteRequest = failFirstRemoteRequest;
+            _failFilesStream = failFilesStream;
+            _holdFilesStreamOpen = holdFilesStreamOpen;
             _serverTask = Task.Run(Serve);
         }
 
@@ -445,15 +723,31 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
             }
         }
         public int StatusRequestCount { get; private set; }
+        public IReadOnlyList<string> DeletePaths
+        {
+            get
+            {
+                lock (_deletePaths)
+                {
+                    return _deletePaths.ToArray();
+                }
+            }
+        }
 
-        public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest = false)
+        public static Task<MockAndroidService> Start(IReadOnlyDictionary<string, byte[]> files, bool failFirstRemoteRequest = false, bool failFilesStream = false, bool holdFilesStreamOpen = false)
         {
             var port = GetFreePort();
             var baseUrl = $"http://127.0.0.1:{port}";
             var listener = new HttpListener();
             listener.Prefixes.Add($"{baseUrl}/");
             listener.Start();
-            return Task.FromResult(new MockAndroidService(listener, baseUrl, files, failFirstRemoteRequest));
+            return Task.FromResult(new MockAndroidService(listener, baseUrl, files, failFirstRemoteRequest, failFilesStream, holdFilesStreamOpen));
+        }
+
+        public async Task WaitForFilesStream()
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await _filesStreamStarted.Task.WaitAsync(timeout.Token);
         }
 
         public async Task<AndroidRequest> GetSingleRequest()
@@ -494,7 +788,7 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
                 if (context.Request.Url?.AbsolutePath == "/api/v1/status")
                 {
                     StatusRequestCount++;
-                    var body = Encoding.UTF8.GetBytes("""{"activeJobs":0,"maxJobs":1}""");
+                    var body = Encoding.UTF8.GetBytes("""{"activeJobs":0,"maxJobs":255}""");
                     context.Response.StatusCode = 200;
                     context.Response.ContentType = "application/json";
                     context.Response.ContentLength64 = body.Length;
@@ -504,14 +798,39 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
                 }
 
                 var path = context.Request.Url?.AbsolutePath ?? "";
+                if (path.StartsWith("/api/v1/remoteprocesses/", StringComparison.Ordinal) && context.Request.HttpMethod == "DELETE")
+                {
+                    lock (_deletePaths)
+                    {
+                        _deletePaths.Add(path);
+                    }
+                    var body = """{"canceled":true}"""u8.ToArray();
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "application/json";
+                    context.Response.ContentLength64 = body.Length;
+                    await context.Response.OutputStream.WriteAsync(body);
+                    context.Response.Close();
+                    continue;
+                }
+
                 if (path == "/api/v1/remoteprocesses" && context.Request.HttpMethod == "POST")
                 {
+                    using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding);
+                    var requestBody = await reader.ReadToEndAsync();
+                    using var document = JsonDocument.Parse(requestBody);
+                    var root = document.RootElement;
+                    var executable = root.TryGetProperty("executable", out var executableElement)
+                        ? executableElement.GetString() ?? ""
+                        : "";
+                    var remoteArgs = root.TryGetProperty("args", out var argsElement)
+                        ? argsElement.GetRawText()
+                        : "";
                     var request = new AndroidRequest(
                         path,
                         context.Request.Headers["Authorization"] ?? "",
                         context.Request.ContentType ?? "",
-                        context.Request.Headers["X-Remote-Executable"] ?? "",
-                        DecodeArgs(context.Request.Headers["X-Remote-Args"] ?? ""),
+                        executable,
+                        remoteArgs,
                         ParseQuery(context.Request.Url?.Query ?? ""),
                         0,
                         []);
@@ -563,10 +882,33 @@ echo '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"hei
 
                 if (path == "/api/v1/remoteprocesses/job-1/files" && context.Request.HttpMethod == "GET")
                 {
+                    _filesStreamStarted.TrySetResult();
+                    if (_failFilesStream)
+                    {
+                        context.Response.StatusCode = 503;
+                        context.Response.Close();
+                        continue;
+                    }
+
                     context.Response.StatusCode = 200;
                     var boundary = "test-boundary";
                     context.Response.ContentType = "multipart/mixed; boundary=" + boundary;
                     context.Response.SendChunked = true;
+                    var ready = Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/octet-stream\r\nX-Remote-Event: ready\r\nContent-Length: 0\r\n\r\n\r\n");
+                    await context.Response.OutputStream.WriteAsync(ready);
+                    await context.Response.OutputStream.FlushAsync();
+                    if (_holdFilesStreamOpen)
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            while (_listener.IsListening)
+                            {
+                                await Task.Delay(100);
+                            }
+                            context.Response.Close();
+                        });
+                        continue;
+                    }
                     foreach (var file in _files)
                     {
                         var partHeaders = Encoding.ASCII.GetBytes(
