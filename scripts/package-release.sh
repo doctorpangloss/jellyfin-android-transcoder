@@ -19,6 +19,7 @@ dotnet publish "$ROOT/jellyfin-android-transcoder/src/Jellyfin.Plugin.AndroidTra
   -o "$WORK/plugin-publish"
 
 cp "$WORK/plugin-publish/Jellyfin.Plugin.AndroidTranscoder.dll" "$WORK/plugin/Android Transcoder_$VERSION/Jellyfin.Plugin.AndroidTranscoder.dll"
+cp "$WORK/plugin-publish/QRCoder.dll" "$WORK/plugin/Android Transcoder_$VERSION/QRCoder.dll"
 cp "$WORK/shim/jfat-ffmpeg" "$WORK/plugin/Android Transcoder_$VERSION/shim-payload/jfat-ffmpeg"
 chmod 755 "$WORK/plugin/Android Transcoder_$VERSION/shim-payload/jfat-ffmpeg"
 cat > "$WORK/plugin/Android Transcoder_$VERSION/meta.json" <<JSON

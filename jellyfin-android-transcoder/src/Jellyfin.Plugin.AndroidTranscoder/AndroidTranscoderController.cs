@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
@@ -398,13 +399,8 @@ public sealed class AndroidTranscoderController : ControllerBase
             try
             {
                 using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-                using var request = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/api/v1/status");
-                if (!string.IsNullOrWhiteSpace(token))
-                {
-                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                }
-                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
-                if (response.IsSuccessStatusCode)
+                var probe = await ProbeAndroid(client, baseUrl, token, timeout.Token);
+                if (probe.Connected)
                 {
                     return baseUrl;
                 }
@@ -428,19 +424,47 @@ public sealed class AndroidTranscoderController : ControllerBase
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
-            using var request = new HttpRequestMessage(HttpMethod.Get, $"{config.AndroidBaseUrl.TrimEnd('/')}/api/v1/status");
-            if (!string.IsNullOrWhiteSpace(config.Token))
-            {
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
-            }
             var client = _httpClientFactory.CreateClient();
-            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
-            return response.IsSuccessStatusCode ? "Connected" : $"Phone returned {(int)response.StatusCode}";
+            var probe = await ProbeAndroid(client, config.AndroidBaseUrl.TrimEnd('/'), config.Token, timeout.Token);
+            return probe.Connected ? "Connected" : probe.Message;
         }
         catch
         {
             return "Phone not reachable";
         }
+    }
+
+    private static async Task<AndroidProbeResult> ProbeAndroid(
+        HttpClient client,
+        string baseUrl,
+        string token,
+        CancellationToken cancellationToken)
+    {
+        using (var statusRequest = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl.TrimEnd('/')}/api/v1/status"))
+        {
+            using var statusResponse = await client.SendAsync(statusRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            if (!statusResponse.IsSuccessStatusCode)
+            {
+                return new AndroidProbeResult(false, $"Phone status returned {(int)statusResponse.StatusCode}");
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return new AndroidProbeResult(false, "Android token missing");
+        }
+
+        using var authRequest = new HttpRequestMessage(HttpMethod.Delete, $"{baseUrl.TrimEnd('/')}/api/v1/remoteprocesses/jfat-token-probe");
+        authRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        using var authResponse = await client.SendAsync(authRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        return authResponse.StatusCode switch
+        {
+            HttpStatusCode.NotFound => new AndroidProbeResult(true, "Connected"),
+            HttpStatusCode.Unauthorized => new AndroidProbeResult(false, "Phone auth failed (401)"),
+            HttpStatusCode.Forbidden => new AndroidProbeResult(false, "Phone auth failed (403)"),
+            _ when authResponse.IsSuccessStatusCode => new AndroidProbeResult(true, "Connected"),
+            _ => new AndroidProbeResult(false, $"Phone API returned {(int)authResponse.StatusCode}")
+        };
     }
 
     private static string RenderPage(PluginConfiguration config, string pairingUrl, string status)
@@ -620,3 +644,5 @@ public sealed class AndroidTranscoderController : ControllerBase
 public sealed record SourceTicket(
     [property: JsonPropertyName("path")] string Path,
     [property: JsonPropertyName("exp")] long ExpiresUnixSeconds);
+
+internal sealed record AndroidProbeResult(bool Connected, string Message);
