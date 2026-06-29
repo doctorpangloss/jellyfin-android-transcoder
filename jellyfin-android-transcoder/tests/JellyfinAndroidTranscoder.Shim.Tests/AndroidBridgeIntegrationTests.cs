@@ -370,6 +370,59 @@ JSON
     }
 
     [Fact]
+    public async Task RogueOneForcedPgsOverlayCommandStillRoutesVideoThroughAndroid()
+    {
+        var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-rogue-one.sh");
+        var ffprobe = WriteExecutable("fake-ffprobe-rogue-one.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"51678189","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"8037.76"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "rogue-one-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "Rogue One A Star Wars Story (2016) Remux-2160p.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("rogue-one-hevc-data-", 4096)));
+        var output = Path.Combine(_tempDir, "e5b1b7725de32c7ed3db328b4ba6d7e8.m3u8");
+        var init = Path.Combine(_tempDir, "e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4");
+        var segment = Path.Combine(_tempDir, "e5b1b7725de32c7ed3db328b4ba6d7e80.mp4");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4"] = "rogue-fmp4-init"u8.ToArray(),
+            ["e5b1b7725de32c7ed3db328b4ba6d7e80.mp4"] = "rogue-fmp4-media"u8.ToArray(),
+            ["e5b1b7725de32c7ed3db328b4ba6d7e8.m3u8"] =
+                "#EXTM3U\n#EXT-X-MAP:URI=\"e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4\"\n#EXTINF:3.000,\ne5b1b7725de32c7ed3db328b4ba6d7e80.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main(RogueOneForcedPgsOverlayArgs(input, output));
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
+        Assert.Equal("remuxed-init", await File.ReadAllTextAsync(init));
+        Assert.Equal("remuxed-media", await File.ReadAllTextAsync(segment));
+
+        var request = await android.GetSingleRequest();
+        Assert.Equal("/api/v1/remoteprocesses", request.Path);
+        Assert.Equal(1, android.StatusRequestCount);
+        Assert.Contains("\"-c:v\",\"hevc_mediacodec\"", request.RemoteArgs);
+        Assert.Contains("\"-c:v\",\"h264_mediacodec\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap\",\"1\"", request.RemoteArgs);
+        Assert.Contains("\"-output_width\",\"1920\"", request.RemoteArgs);
+        Assert.Contains("\"-output_height\",\"1088\"", request.RemoteArgs);
+        Assert.Contains("\"-b:v\",\"5616000\"", request.RemoteArgs);
+        Assert.Contains("\"-f\",\"mpegts\"", request.RemoteArgs);
+        Assert.Contains("\"pipe:1\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"overlay", request.RemoteArgs);
+        Assert.DoesNotContain("\"-filter_complex\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-f\",\"hls\"", request.RemoteArgs);
+    }
+
+    [Fact]
     public async Task JellyfinFollowupSegmentSeekIsForwardedBeforeRemoteInput()
     {
         var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-seek.sh");
@@ -768,6 +821,27 @@ exit 0
         "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "70e040ca627b1a5a2ecb0618aa77f67c-1.mp4",
         "-start_number", "0", "-hls_segment_filename",
         Path.Combine(Path.GetDirectoryName(output)!, "70e040ca627b1a5a2ecb0618aa77f67c%d.mp4"),
+        "-hls_playlist_type", "vod", "-hls_list_size", "0",
+        "-hls_segment_options", "movflags=+frag_discont", "-y", output
+    ];
+
+    private static string[] RogueOneForcedPgsOverlayArgs(string input, string output) =>
+    [
+        "-analyzeduration", "200M", "-probesize", "1G", "-i", $"file:{input}",
+        "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+        "-map", "0:0", "-map", "0:1", "-map", "-0:0",
+        "-codec:v:0", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-maxrate", "5616000", "-bufsize", "11232000", "-profile:v:0", "high",
+        "-level", "51", "-x264opts:0", "subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0",
+        "-force_key_frames:0", "expr:gte(t,n_forced*3)", "-sc_threshold:v:0", "0",
+        "-filter_complex",
+        @"[0:3]scale,scale=-1:1080:fast_bilinear,crop,pad=max(1920\,iw):max(1080\,ih):(ow-iw)/2:(oh-ih)/2:black@0,crop=1920:1080[sub];[0:0]setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2,tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p[main];[main][sub]overlay=eof_action=pass:repeatlast=0",
+        "-start_at_zero", "-codec:a:0", "libfdk_aac", "-ac", "2", "-ab", "256000", "-af", "volume=2",
+        "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
+        "-f", "hls", "-max_delay", "5000000", "-hls_time", "3",
+        "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4",
+        "-start_number", "0", "-hls_segment_filename",
+        Path.Combine(Path.GetDirectoryName(output)!, "e5b1b7725de32c7ed3db328b4ba6d7e8%d.mp4"),
         "-hls_playlist_type", "vod", "-hls_list_size", "0",
         "-hls_segment_options", "movflags=+frag_discont", "-y", output
     ];

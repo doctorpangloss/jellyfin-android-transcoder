@@ -113,8 +113,7 @@ public sealed class FfmpegCommand
         Args.Contains("-f") &&
         ValueAfter("-f") == "hls" &&
         (ValueAfter("-codec:v:0") == "libx264" || ValueAfter("-c:v:0") == "libx264") &&
-        !Args.Any(a => a.Contains("subtitles=", StringComparison.OrdinalIgnoreCase) ||
-                       a.Contains("overlay", StringComparison.OrdinalIgnoreCase));
+        !Args.Any(a => a.Contains("subtitles=", StringComparison.OrdinalIgnoreCase));
 
     public static FfmpegCommand Parse(IReadOnlyList<string> args)
     {
