@@ -20,7 +20,22 @@ The Android service exposes:
 - `POST /api/v1/remoteprocesses`
 - `DELETE /api/v1/remoteprocesses/{id}`
 
-The remote process endpoint starts bundled patched FFmpeg, streams input into FFmpeg stdin, and streams completed HLS files back to the shim as `multipart/mixed`. Unsupported Jellyfin commands fall back to the configured real FFmpeg path.
+The remote process endpoint starts bundled patched FFmpeg, streams input into FFmpeg stdin or through a signed Jellyfin source URL, and streams completed HLS files or video-only MPEG-TS stdout back to the shim. Unsupported Jellyfin commands fall back to the configured real FFmpeg path.
+
+## Benchmarks
+
+Measured on June 30, 2026 with Jellyfin `10.11.6`, plugin/shim `1.1.11`, Jellyfin FFmpeg `7.1.3-Jellyfin`, and the Android worker running on a Pixel-class device with the bundled Android MediaCodec FFmpeg build. The Synology baseline is the AMD Ryzen Embedded V1500B running Jellyfin's software `libx264` path.
+
+The input was a local 4K HEVC 10-bit remux sample. The benchmark command was Jellyfin-shaped HLS output at 1080p H.264, 6 Mbps, 3 second fMP4 segments, video only. RT rate is HLS media seconds produced divided by elapsed wall-clock seconds.
+
+| Workload | Path | Window | Media produced | RT rate | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| 4K HEVC10 SDR -> 1080p H.264 | V1500B software `libx264` | 25.835 s | 30 s | 1.16x | Real-time on this sample. |
+| 4K HEVC10 SDR -> 1080p H.264 | Android MediaCodec | 25.069 s | 27 s | 1.08x | Real-time, but close to the V1500B because network/source/HLS overhead dominates. |
+| 4K HEVC10 HDR10 -> 1080p H.264 SDR | V1500B software tone map + `libx264` | 26.546 s | 18 s | 0.68x | Not real-time. |
+| 4K HEVC10 HDR10 -> 1080p H.264 SDR | Android MediaCodec + GLES surface tonemap | 60.100 s | 21 s | 0.35x | Not ready for real-time; first 25 s produced no full HLS segment on this sample. |
+
+Interpretation: the Android path is viable for simple SDR HEVC transcodes, but the current HDR surface-tonemap path needs more work before it can replace local fallback. PGS/image subtitle burn-in is also not accelerated by this release; avoid burn-in or use client-rendered/text subtitles for the Android path.
 
 ## Job Liveness
 

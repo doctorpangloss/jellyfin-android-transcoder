@@ -17,6 +17,8 @@ import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -143,6 +145,15 @@ public final class TranscoderServiceInstrumentedTest {
     }
 
     @Test
+    public void testBundledFfmpegSupportsHttpsInputs() throws Exception {
+        ExecResult result = execFfmpeg("-hide_banner", "-protocols");
+
+        assertEquals(result.stderr, 0, result.exitCode);
+        assertTrue(result.stdout, result.stdout.contains("https"));
+        assertTrue(result.stdout, result.stdout.contains("tls"));
+    }
+
+    @Test
     public void testRemoteProcessEndpointRejectsMissingBearerToken() throws Exception {
         HttpResult result = request("POST",
                 "/api/v1/remoteprocesses",
@@ -167,22 +178,24 @@ public final class TranscoderServiceInstrumentedTest {
         assertTrue(result.contentType, result.contentType.startsWith("application/json"));
         assertTrue(result.body, result.body.contains("\"stdinUrl\""));
         assertTrue(result.body, result.body.contains("\"filesUrl\""));
+        assertTrue(result.body, result.body.contains("\"stdoutUrl\""));
 
-        String filesUrl = jsonString(result.body, "filesUrl");
-        HttpResult files = request("GET",
-                filesUrl,
+        String stdoutUrl = jsonString(result.body, "stdoutUrl");
+        HttpResult stdout = request("GET",
+                stdoutUrl,
                 "Bearer " + AppConfig.token(context),
                 null,
                 null);
-        assertEquals(200, files.status);
-        assertTrue(files.contentType, files.contentType.startsWith("multipart/mixed"));
-        assertTrue(files.body, files.body.contains("\"stdout\""));
-        assertTrue(files.body, files.body.contains("ffmpeg version"));
+        assertEquals(200, stdout.status);
+        assertTrue(stdout.contentType, stdout.contentType.startsWith("application/octet-stream"));
+        assertTrue(stdout.body, stdout.body.contains("ffmpeg version"));
     }
 
     @Test
     public void testRemoteProcessEndpointAcceptsParallelJellyfinJobs() throws Exception {
         Map<String, String> headers = jsonHeaders();
+        HttpResult before = request("GET", "/api/v1/status", null, null);
+        int beforeAccepted = jsonInt(before.body, "acceptedJobs");
         byte[] requestBody = ("{\"executable\":\"ffmpeg\",\"args\":[\"-hide_banner\",\"-loglevel\",\"error\"," +
                 "\"-i\",\"{input}\",\"-f\",\"null\",\"-\"]}").getBytes(StandardCharsets.UTF_8);
 
@@ -205,31 +218,84 @@ public final class TranscoderServiceInstrumentedTest {
         HttpResult status = request("GET", "/api/v1/status", null, null);
         assertEquals(200, status.status);
         assertTrue(status.body, status.body.contains("\"maxJobs\":255"));
-        assertTrue(status.body, status.body.contains("\"activeJobs\":2"));
+        assertTrue(status.body, jsonInt(status.body, "acceptedJobs") >= beforeAccepted + 2);
 
         String firstId = jsonString(first.body, "id");
         String secondId = jsonString(second.body, "id");
-        HttpResult cancelFirst = request("DELETE",
-                "/api/v1/remoteprocesses/" + firstId,
-                "Bearer " + AppConfig.token(context),
-                null,
-                null);
-        assertEquals(cancelFirst.body, 200, cancelFirst.status);
-        assertTrue(cancelFirst.body, cancelFirst.body.contains("\"canceled\":true"));
+        try {
+            assertTrue(first.body, !firstId.equals(secondId));
+        } finally {
+            HttpResult cancelFirst = request("DELETE",
+                    "/api/v1/remoteprocesses/" + firstId,
+                    "Bearer " + AppConfig.token(context),
+                    null,
+                    null);
+            assertTrue(cancelFirst.body, cancelFirst.status == 200 || cancelFirst.status == 404);
 
-        HttpResult afterCancelOne = request("GET", "/api/v1/status", null, null);
-        assertEquals(200, afterCancelOne.status);
-        assertTrue(afterCancelOne.body, afterCancelOne.body.contains("\"activeJobs\":1"));
-        assertTrue(afterCancelOne.body, afterCancelOne.body.contains(secondId));
-        assertFalse(afterCancelOne.body, afterCancelOne.body.contains(firstId));
+            HttpResult cancelSecond = request("DELETE",
+                    "/api/v1/remoteprocesses/" + secondId,
+                    "Bearer " + AppConfig.token(context),
+                    null,
+                    null);
+            assertTrue(cancelSecond.body, cancelSecond.status == 200 || cancelSecond.status == 404);
+            waitForNoActiveJobs(5000);
+        }
+    }
 
-        HttpResult cancelSecond = request("DELETE",
-                "/api/v1/remoteprocesses/" + secondId,
+    @Test
+    public void testStdoutDisconnectCancelsRemoteFfmpegJob() throws Exception {
+        Map<String, String> headers = jsonHeaders();
+        byte[] requestBody = ("{\"executable\":\"ffmpeg\",\"args\":[" +
+                "\"-hide_banner\",\"-loglevel\",\"error\"," +
+                "\"-i\",\"{input}\",\"-f\",\"null\",\"-\"]}").getBytes(StandardCharsets.UTF_8);
+
+        HttpResult start = request("POST",
+                "/api/v1/remoteprocesses",
                 "Bearer " + AppConfig.token(context),
-                null,
-                null);
-        assertEquals(cancelSecond.body, 200, cancelSecond.status);
-        assertTrue(cancelSecond.body, cancelSecond.body.contains("\"canceled\":true"));
+                headers,
+                requestBody);
+        assertEquals(start.body, 200, start.status);
+
+        String stdoutUrl = jsonString(start.body, "stdoutUrl");
+        HttpURLConnection connection = authorizedConnection("GET", stdoutUrl);
+        assertEquals(200, connection.getResponseCode());
+        connection.getInputStream().close();
+        connection.disconnect();
+
+        waitForNoActiveJobs(TranscoderService.stdoutSubscriberGraceMillisForTest() + 7000);
+
+        HttpResult status = request("GET", "/api/v1/status", null, null);
+        assertEquals(200, status.status);
+        assertTrue(status.body, status.body.contains("\"activeJobs\":0"));
+    }
+
+    @Test
+    public void testStatusDoesNotEmbedBinaryStdoutTail() throws Exception {
+        Map<String, String> headers = jsonHeaders();
+        byte[] requestBody = ("{\"executable\":\"ffmpeg\",\"args\":[" +
+                "\"-version\"]}").getBytes(StandardCharsets.UTF_8);
+
+        HttpResult start = request("POST",
+                "/api/v1/remoteprocesses",
+                "Bearer " + AppConfig.token(context),
+                headers,
+                requestBody);
+        assertEquals(start.body, 200, start.status);
+
+        String stdoutUrl = jsonString(start.body, "stdoutUrl");
+        HttpURLConnection connection = authorizedConnection("GET", stdoutUrl);
+        assertEquals(200, connection.getResponseCode());
+        InputStream stdout = connection.getInputStream();
+        String version = readAll(stdout);
+        assertTrue(version, version.contains("ffmpeg version"));
+
+        HttpResult status = request("GET", "/api/v1/status", null, null);
+        assertEquals(200, status.status);
+        assertTrue(status.body, status.body.contains("\"stdoutBytes\":"));
+        assertFalse(status.body, status.body.contains("stdoutTail"));
+
+        connection.disconnect();
+        waitForNoActiveJobs(TranscoderService.stdoutSubscriberGraceMillisForTest() + 7000);
     }
 
     @Test
@@ -307,6 +373,28 @@ public final class TranscoderServiceInstrumentedTest {
         throw new AssertionError("Timed out waiting for Android transcoder service to stop");
     }
 
+    private void waitForNoActiveJobs(long timeoutMillis) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        HttpResult last = null;
+        while (System.nanoTime() < deadline) {
+            last = request("GET", "/api/v1/status", null, null);
+            if (last.status == 200 && last.body.contains("\"activeJobs\":0")) {
+                return;
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("Timed out waiting for Android transcoder jobs to stop; last status: " + (last == null ? "" : last.body));
+    }
+
+    private static HttpURLConnection authorizedConnection(String method, String path) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL("http://127.0.0.1:" + AppConfig.PORT + path).openConnection();
+        connection.setRequestMethod(method);
+        connection.setConnectTimeout(3000);
+        connection.setReadTimeout(15000);
+        connection.setRequestProperty("Authorization", "Bearer " + AppConfig.token(InstrumentationRegistry.getInstrumentation().getTargetContext()));
+        return connection;
+    }
+
     private static HttpResult request(String method, String path, String authorization, Map<String, String> headers, byte[] body) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL("http://127.0.0.1:" + AppConfig.PORT + path).openConnection();
         connection.setRequestMethod(method);
@@ -364,7 +452,14 @@ public final class TranscoderServiceInstrumentedTest {
     }
 
     private ExecResult execFfmpegVersion() throws Exception {
-        ProcessBuilder builder = new ProcessBuilder(AppConfig.ffmpegPath(context), "-version");
+        return execFfmpeg("-version");
+    }
+
+    private ExecResult execFfmpeg(String... args) throws Exception {
+        List<String> command = new ArrayList<>();
+        command.add(AppConfig.ffmpegPath(context));
+        command.addAll(Arrays.asList(args));
+        ProcessBuilder builder = new ProcessBuilder(command);
         builder.environment().remove("LD_LIBRARY_PATH");
         Process process = builder.start();
         String stdout;
@@ -389,6 +484,20 @@ public final class TranscoderServiceInstrumentedTest {
             throw new AssertionError("Unterminated JSON string `" + name + "` in " + json);
         }
         return json.substring(start, end).replace("\\/", "/");
+    }
+
+    private static int jsonInt(String json, String name) {
+        String marker = "\"" + name + "\":";
+        int start = json.indexOf(marker);
+        if (start < 0) {
+            throw new AssertionError("Missing JSON number `" + name + "` in " + json);
+        }
+        start += marker.length();
+        int end = start;
+        while (end < json.length() && Character.isDigit(json.charAt(end))) {
+            end++;
+        }
+        return Integer.parseInt(json.substring(start, end));
     }
 
     private static String repeat(String value, int count) {

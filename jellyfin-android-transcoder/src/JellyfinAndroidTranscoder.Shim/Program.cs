@@ -16,6 +16,7 @@ public static class Program
     public static async Task<int> Main(string[] args)
     {
         var config = ShimConfig.Load();
+        args = FfmpegArgumentParser.Normalize(args);
         var command = FfmpegCommand.Parse(args);
 
         if (!config.Enabled || !command.CanConsiderRouting)
@@ -52,6 +53,93 @@ public static class Program
 
     private static bool IsForwardedProcessSignalExit(int exitCode) =>
         exitCode is 129 or 130 or 131 or 143;
+}
+
+public static class FfmpegArgumentParser
+{
+    public static string[] Normalize(string[] args)
+    {
+        if (args.Length != 1 || !LooksLikeSingleCommandLine(args[0]))
+        {
+            return args;
+        }
+
+        return Split(args[0]).ToArray();
+    }
+
+    private static bool LooksLikeSingleCommandLine(string value) =>
+        value.Contains(" -", StringComparison.Ordinal) ||
+        value.Contains(" file:", StringComparison.Ordinal) ||
+        value.Contains(" \"", StringComparison.Ordinal);
+
+    public static IReadOnlyList<string> Split(string commandLine)
+    {
+        var result = new List<string>();
+        var current = new StringBuilder();
+        var inSingleQuote = false;
+        var inDoubleQuote = false;
+        var escaped = false;
+
+        foreach (var c in commandLine)
+        {
+            if (escaped)
+            {
+                current.Append(c);
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\')
+            {
+                if (inSingleQuote)
+                {
+                    current.Append(c);
+                }
+                else
+                {
+                    escaped = true;
+                }
+                continue;
+            }
+
+            if (c == '\'' && !inDoubleQuote)
+            {
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+
+            if (c == '"' && !inSingleQuote)
+            {
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+
+            if (char.IsWhiteSpace(c) && !inSingleQuote && !inDoubleQuote)
+            {
+                Flush();
+                continue;
+            }
+
+            current.Append(c);
+        }
+
+        if (escaped)
+        {
+            current.Append('\\');
+        }
+        Flush();
+        return result;
+
+        void Flush()
+        {
+            if (current.Length == 0)
+            {
+                return;
+            }
+            result.Add(current.ToString());
+            current.Clear();
+        }
+    }
 }
 
 public sealed record ShimConfig(
@@ -95,6 +183,8 @@ public sealed class FfmpegCommand
     public string? InputPath { get; init; }
     public string? OutputPath { get; init; }
     public string? SeekBeforeInput { get; init; }
+    public IReadOnlyList<string> InputOptions { get; init; } = Array.Empty<string>();
+    public IReadOnlyList<string> PositiveMaps { get; init; } = Array.Empty<string>();
     public int MaxRate { get; init; }
     public int BufSize { get; init; }
     public int Height { get; init; }
@@ -106,12 +196,15 @@ public sealed class FfmpegCommand
     public string? AudioFilter { get; init; }
     public string? HlsSegmentFilename { get; init; }
     public IReadOnlyList<string> HlsArgs { get; init; } = Array.Empty<string>();
+    public bool AudioRequested { get; init; }
+    public string? FilterComplex { get; init; }
+    public TonemapxOptions? Tonemapx { get; init; }
+    public string? OutputFormat { get; init; }
 
     public bool CanConsiderRouting =>
         InputPath is not null &&
         OutputPath is not null &&
-        Args.Contains("-f") &&
-        ValueAfter("-f") == "hls" &&
+        OutputFormat == "hls" &&
         (ValueAfter("-codec:v:0") == "libx264" || ValueAfter("-c:v:0") == "libx264") &&
         !Args.Any(a => a.Contains("subtitles=", StringComparison.OrdinalIgnoreCase));
 
@@ -125,30 +218,40 @@ public sealed class FfmpegCommand
         }
 
         var output = args.LastOrDefault(a => a.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase));
+        var outputFormatIndex = LastIndexOf(args, "-f");
         var hlsStart = IndexOf(args, "-copyts");
         if (hlsStart < 0)
         {
-            hlsStart = IndexOf(args, "-f");
+            hlsStart = outputFormatIndex;
         }
 
-        var scaleWidth = ParseScaleWidth(ValueAfter(args, "-vf"));
+        var videoFilter = ValueAfter(args, "-vf");
+        var filterComplex = ValueAfter(args, "-filter_complex");
+        var scaleWidth = ParseScaleWidth(videoFilter ?? filterComplex);
         return new FfmpegCommand
         {
             Args = args.ToArray(),
             InputPath = string.IsNullOrWhiteSpace(input) ? null : input,
             OutputPath = output,
             SeekBeforeInput = ValueBefore(args, "-ss", inputIndex),
+            InputOptions = inputIndex > 0 ? args.Take(inputIndex).ToArray() : Array.Empty<string>(),
+            PositiveMaps = PositiveMapValues(args).ToArray(),
             MaxRate = ParseBitrate(ValueAfter(args, "-maxrate"), 6_000_000),
             BufSize = ParseBitrate(ValueAfter(args, "-bufsize"), 12_000_000),
             Width = scaleWidth ?? 1920,
-            Height = ParseScaleHeight(ValueAfter(args, "-vf"), scaleWidth) ?? 1080,
+            Height = ParseScaleHeight(videoFilter ?? filterComplex, scaleWidth) ?? 1080,
             GopSeconds = ParseForceKeySeconds(ValueAfter(args, "-force_key_frames:0")) ?? 3,
-            AudioCodec = ValueAfter(args, "-codec:a:0") ?? "copy",
+            AudioCodec = ValueAfter(args, "-codec:a:0") ?? ValueAfter(args, "-c:a:0") ?? "copy",
             AudioBitrate = ValueAfter(args, "-ab"),
             AudioChannels = ValueAfter(args, "-ac"),
             AudioFilter = ValueAfter(args, "-af"),
             HlsSegmentFilename = ValueAfter(args, "-hls_segment_filename"),
-            HlsArgs = hlsStart >= 0 ? args.Skip(hlsStart).Take(args.Count - hlsStart - 1).ToArray() : Array.Empty<string>()
+            HlsArgs = hlsStart >= 0 ? args.Skip(hlsStart).Take(args.Count - hlsStart - 1).ToArray() : Array.Empty<string>(),
+            AudioRequested = !args.Contains("-an") &&
+                (IndexOf(args, "-codec:a:0") >= 0 || IndexOf(args, "-c:a:0") >= 0 || IndexOf(args, "-codec:a") >= 0 || IndexOf(args, "-c:a") >= 0),
+            FilterComplex = filterComplex,
+            Tonemapx = TonemapxOptions.Parse(videoFilter) ?? TonemapxOptions.Parse(filterComplex),
+            OutputFormat = outputFormatIndex >= 0 && outputFormatIndex + 1 < args.Count ? args[outputFormatIndex + 1] : null
         };
     }
 
@@ -170,6 +273,30 @@ public sealed class FfmpegCommand
             }
         }
         return -1;
+    }
+
+    private static int LastIndexOf(IReadOnlyList<string> args, string key)
+    {
+        for (var i = args.Count - 1; i >= 0; i--)
+        {
+            if (args[i] == key)
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static IEnumerable<string> PositiveMapValues(IReadOnlyList<string> args)
+    {
+        for (var i = 0; i + 1 < args.Count; i++)
+        {
+            if (args[i] == "-map" && !args[i + 1].StartsWith("-", StringComparison.Ordinal))
+            {
+                yield return args[i + 1];
+                i++;
+            }
+        }
     }
 
     private static string? ValueBefore(IReadOnlyList<string> args, string key, int beforeIndex)
@@ -248,6 +375,68 @@ public sealed class FfmpegCommand
         var match = Regex.Match(forceKey, @"n_forced\*([0-9]+)");
         return match.Success ? int.Parse(match.Groups[1].Value) : null;
     }
+}
+
+public sealed record TonemapxOptions(
+    string Algorithm,
+    string Transfer,
+    string Matrix,
+    string Primaries,
+    string Range,
+    string Format,
+    string? Param,
+    string Desat,
+    string? Peak,
+    bool ApplyDovi)
+{
+    public static TonemapxOptions Default { get; } =
+        new("bt2390", "bt709", "bt709", "bt709", "tv", "same", null, "0", null, true);
+
+    public static TonemapxOptions? Parse(string? filterGraph)
+    {
+        if (string.IsNullOrWhiteSpace(filterGraph))
+        {
+            return null;
+        }
+
+        var match = Regex.Match(filterGraph, @"(?:^|[,;\]])tonemapx(?:=(?<options>[^\[,\];]+))?", RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var options = match.Groups["options"].Success ? match.Groups["options"].Value : "";
+        foreach (var token in options.Split(':', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separator = token.IndexOf('=');
+            if (separator < 0)
+            {
+                values["tonemap"] = token;
+                continue;
+            }
+
+            values[token[..separator]] = token[(separator + 1)..];
+        }
+
+        var defaults = Default;
+        return defaults with
+        {
+            Algorithm = Value(values, "tonemap", defaults.Algorithm),
+            Transfer = Value(values, "t", Value(values, "transfer", defaults.Transfer)),
+            Matrix = Value(values, "m", Value(values, "matrix", defaults.Matrix)),
+            Primaries = Value(values, "p", Value(values, "primaries", defaults.Primaries)),
+            Range = Value(values, "r", Value(values, "range", defaults.Range)),
+            Format = Value(values, "format", defaults.Format),
+            Param = values.TryGetValue("param", out var param) ? param : defaults.Param,
+            Desat = Value(values, "desat", defaults.Desat),
+            Peak = values.TryGetValue("peak", out var peak) ? peak : defaults.Peak,
+            ApplyDovi = !values.TryGetValue("apply_dovi", out var applyDovi) || applyDovi != "0"
+        };
+    }
+
+    private static string Value(Dictionary<string, string> values, string key, string fallback) =>
+        values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : fallback;
 }
 
 public sealed record MediaProbe(
@@ -439,21 +628,40 @@ public static class AndroidTranscode
         using var uploadClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         using var stdoutClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         var baseUri = config.AndroidBaseUrl.TrimEnd('/');
-        var sourceUrl = SourceUrlSigner.TryCreate(config, command.InputPath!);
-        var job = await StartRemoteProcess(controlClient, baseUri, config.Token, BuildRemoteMpegtsArgs(config, command, probe, sourceUrl), startupTimeout.Token);
+        var sourceUrl = SourceUrlSigner.TryCreate(config, command.InputPath!, command.SeekBeforeInput);
+        var useRemoteStdout = ShouldUseRemoteVideoStdout(command);
+        var remoteArgs = useRemoteStdout
+            ? BuildRemoteMpegtsArgs(config, command, probe, sourceUrl)
+            : BuildRemoteHlsArgs(config, command, probe, sourceUrl);
+        Console.Error.WriteLine("jfat: remote ffmpeg args " + JsonSerializer.Serialize(remoteArgs));
+        var job = await StartRemoteProcess(controlClient, baseUri, config.Token, remoteArgs, startupTimeout.Token);
         var stopRequest = new TaskCompletionSource<ProcessStopRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
         var stdinControlTask = WaitForFfmpegQuitCommand(stopRequest, remoteStop.Token);
         using var signalHandlers = RegisterProcessSignalHandlers(stopRequest);
 
         try
         {
-            if (string.IsNullOrWhiteSpace(job.StdoutUrl))
+            if (!useRemoteStdout && string.IsNullOrWhiteSpace(job.FilesUrl))
+            {
+                throw new InvalidOperationException("Android did not return filesUrl.");
+            }
+            if (useRemoteStdout && string.IsNullOrWhiteSpace(job.StdoutUrl))
             {
                 throw new InvalidOperationException("Android did not return stdoutUrl.");
             }
-            using var stdoutRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.StdoutUrl);
-            stdoutRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
-            var stdoutResponseTask = stdoutClient.SendAsync(stdoutRequest, HttpCompletionOption.ResponseHeadersRead, remoteStop.Token);
+
+            Task<HttpResponseMessage> outputResponseTask;
+            HttpRequestMessage outputRequest;
+            if (useRemoteStdout)
+            {
+                outputRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.StdoutUrl);
+            }
+            else
+            {
+                outputRequest = new HttpRequestMessage(HttpMethod.Get, baseUri + job.FilesUrl);
+            }
+            outputRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Token);
+            outputResponseTask = stdoutClient.SendAsync(outputRequest, HttpCompletionOption.ResponseHeadersRead, remoteStop.Token);
 
             Task<HttpResponseMessage>? stdinTask = null;
             FileStream? input = null;
@@ -470,21 +678,23 @@ public static class AndroidTranscode
                 stdinTask = uploadClient.SendAsync(stdinRequest, HttpCompletionOption.ResponseHeadersRead, remoteStop.Token);
             }
 
-            if (await Task.WhenAny(stdoutResponseTask, stopRequest.Task) == stopRequest.Task)
+            if (await Task.WhenAny(outputResponseTask, stopRequest.Task) == stopRequest.Task)
             {
                 return await StopRemoteProcess(controlClient, baseUri, config.Token, job.Id, remoteStop, await stopRequest.Task);
             }
-            using var stdoutResponse = await stdoutResponseTask;
-            stdoutResponse.EnsureSuccessStatusCode();
+            using var outputResponse = await outputResponseTask;
+            outputResponse.EnsureSuccessStatusCode();
 
-            await using (var stdout = await stdoutResponse.Content.ReadAsStreamAsync(remoteStop.Token))
+            await using (var output = await outputResponse.Content.ReadAsStreamAsync(remoteStop.Token))
             {
-                var remuxTask = RemuxRemoteMpegtsToLocalHls(config, command, stdout, remoteStop.Token);
-                if (await Task.WhenAny(remuxTask, stopRequest.Task) == stopRequest.Task)
+                var outputTask = useRemoteStdout
+                    ? RemuxRemoteMpegtsToLocalHls(config, command, output, remoteStop.Token)
+                    : MultipartUtil.MaterializeFiles(output, MultipartUtil.GetBoundary(outputResponse.Content.Headers.ContentType?.ToString() ?? ""), command);
+                if (await Task.WhenAny(outputTask, stopRequest.Task) == stopRequest.Task)
                 {
                     return await StopRemoteProcess(controlClient, baseUri, config.Token, job.Id, remoteStop, await stopRequest.Task);
                 }
-                var exit = await remuxTask;
+                var exit = await outputTask;
                 remoteStop.Cancel();
                 if (stdinTask is not null)
                 {
@@ -516,6 +726,13 @@ public static class AndroidTranscode
             remoteStop.Cancel();
         }
     }
+
+    private static bool IsMpegtsHls(FfmpegCommand command) =>
+        string.Equals(command.ValueAfter("-hls_segment_type"), "mpegts", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ShouldUseRemoteVideoStdout(FfmpegCommand command) =>
+        IsMpegtsHls(command) ||
+        !string.IsNullOrWhiteSpace(command.FilterComplex);
 
     private static async Task WaitForFfmpegQuitCommand(TaskCompletionSource<ProcessStopRequest> stopRequest, CancellationToken cancellationToken)
     {
@@ -643,6 +860,19 @@ public static class AndroidTranscode
     private static async Task<int> RemuxRemoteMpegtsToLocalHls(ShimConfig config, FfmpegCommand command, Stream remoteStdout, CancellationToken cancellationToken)
     {
         using var process = ProcessUtil.Start(config.RealFfmpegPath, BuildLocalHlsRemuxArgs(command), redirectInput: true, redirectOutput: false);
+        using var cancellation = cancellationToken.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+            }
+        });
         try
         {
             await remoteStdout.CopyToAsync(process.StandardInput.BaseStream, cancellationToken);
@@ -672,13 +902,46 @@ public static class AndroidTranscode
             "-hide_banner",
             "-loglevel", "warning",
             "-f", "mpegts",
-            "-i", "pipe:0",
-            "-map", "0:v:0",
-            "-codec:v:0", "copy",
-            "-an",
-            "-sn",
-            "-dn"
+            "-i", "pipe:0"
         };
+        if (command.AudioRequested && !string.IsNullOrWhiteSpace(command.InputPath))
+        {
+            if (!string.IsNullOrWhiteSpace(command.SeekBeforeInput))
+            {
+                args.Add("-ss");
+                args.Add(command.SeekBeforeInput);
+            }
+            args.Add("-i");
+            args.Add(command.InputPath);
+        }
+
+        args.AddRange(["-map", "0:v:0"]);
+        args.AddRange(["-codec:v:0", "copy"]);
+        if (command.AudioRequested && !string.IsNullOrWhiteSpace(command.InputPath))
+        {
+            args.AddRange(["-map", "1:a:0"]);
+            args.AddRange(["-codec:a:0", command.AudioCodec]);
+            if (!string.IsNullOrWhiteSpace(command.AudioChannels))
+            {
+                args.Add("-ac");
+                args.Add(command.AudioChannels);
+            }
+            if (!string.IsNullOrWhiteSpace(command.AudioBitrate))
+            {
+                args.Add("-ab");
+                args.Add(command.AudioBitrate);
+            }
+            if (!string.IsNullOrWhiteSpace(command.AudioFilter))
+            {
+                args.Add("-af");
+                args.Add(command.AudioFilter);
+            }
+        }
+        else
+        {
+            args.Add("-an");
+        }
+        args.AddRange(["-sn", "-dn"]);
         args.AddRange(HlsArgsWithTempFile(command));
         args.Add(command.OutputPath!);
         return args;
@@ -687,6 +950,12 @@ public static class AndroidTranscode
     private static IReadOnlyList<string> HlsArgsWithTempFile(FfmpegCommand command)
     {
         var hlsArgs = command.HlsArgs.ToList();
+        if (string.Equals(command.ValueAfter("-hls_playlist_type"), "vod", StringComparison.OrdinalIgnoreCase))
+        {
+            RemoveOptionWithValue(hlsArgs, "-hls_playlist_type");
+            return HlsArgsWithoutTempFile(hlsArgs);
+        }
+
         var flagsIndex = hlsArgs.IndexOf("-hls_flags");
         if (flagsIndex >= 0 && flagsIndex + 1 < hlsArgs.Count)
         {
@@ -700,6 +969,165 @@ public static class AndroidTranscode
         }
         return hlsArgs;
     }
+
+    private static void RemoveOptionWithValue(List<string> args, string option)
+    {
+        var index = args.IndexOf(option);
+        if (index >= 0)
+        {
+            args.RemoveRange(index, index + 1 < args.Count ? 2 : 1);
+        }
+    }
+
+    private static IReadOnlyList<string> HlsArgsWithoutTempFile(List<string> hlsArgs)
+    {
+        var flagsIndex = hlsArgs.IndexOf("-hls_flags");
+        if (flagsIndex < 0 || flagsIndex + 1 >= hlsArgs.Count)
+        {
+            return hlsArgs;
+        }
+
+        var flags = hlsArgs[flagsIndex + 1]
+            .Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(flag => !string.Equals(flag, "temp_file", StringComparison.Ordinal))
+            .ToArray();
+        if (flags.Length == 0)
+        {
+            hlsArgs.RemoveRange(flagsIndex, 2);
+        }
+        else
+        {
+            hlsArgs[flagsIndex + 1] = string.Join("+", flags);
+        }
+        return hlsArgs;
+    }
+
+    private static IReadOnlyList<string> BuildRemoteHlsArgs(ShimConfig config, FfmpegCommand command, MediaProbe probe, string? sourceUrl)
+    {
+        var bitrate = Math.Min(command.MaxRate, config.MaxBitrate);
+        var (outputWidth, outputHeight) = OutputDimensions(command, probe);
+        var hlsTime = command.ValueAfter("-hls_time") ?? command.GopSeconds.ToString(CultureInfo.InvariantCulture);
+        var hlsSeconds = ParsePositiveDouble(hlsTime, command.GopSeconds);
+        var gopFrames = Math.Max(1, (int)Math.Round(hlsSeconds * 24));
+        var useHardwareDecoder = config.HardwareCodecsEnabled;
+        var args = new List<string>
+        {
+            "-hide_banner",
+            "-loglevel", "warning"
+        };
+        if (useHardwareDecoder)
+        {
+            args.AddRange([
+                "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
+                "-hwaccel", "mediacodec",
+                "-hwaccel_device", "mc",
+                "-hwaccel_output_format", "mediacodec",
+                "-c:v", "hevc_mediacodec",
+                "-ndk_codec", "1"
+            ]);
+        }
+        AddPreservedInputOptions(args, command, sourceUrl is not null);
+        AddInputStreamDisables(args);
+        args.AddRange(["-i", sourceUrl ?? "{input}"]);
+
+        AddPreservedMaps(args, command);
+        AddPreservedOutputOptions(args, command);
+
+        if (useHardwareDecoder)
+        {
+            var tonemap = command.Tonemapx ?? TonemapxOptions.Default;
+            args.AddRange([
+                "-c:v", "h264_mediacodec",
+                "-pix_fmt", "mediacodec",
+                "-output_width", outputWidth.ToString(CultureInfo.InvariantCulture),
+                "-output_height", Align16(outputHeight).ToString(CultureInfo.InvariantCulture),
+                "-surface_tonemap", probe.IsHdr ? "1" : "0",
+                "-surface_tonemap_algorithm", tonemap.Algorithm,
+                "-surface_tonemap_transfer", tonemap.Transfer,
+                "-surface_tonemap_matrix", tonemap.Matrix,
+                "-surface_tonemap_primaries", tonemap.Primaries,
+                "-surface_tonemap_range", tonemap.Range,
+                "-surface_tonemap_format", tonemap.Format,
+                "-surface_tonemap_desat", tonemap.Desat
+            ]);
+            if (!string.IsNullOrWhiteSpace(tonemap.Param))
+            {
+                args.AddRange(["-surface_tonemap_param", tonemap.Param]);
+            }
+            if (!string.IsNullOrWhiteSpace(tonemap.Peak))
+            {
+                args.AddRange(["-surface_tonemap_peak", tonemap.Peak]);
+            }
+        }
+        else
+        {
+            args.AddRange([
+                "-vf", $"scale={outputWidth}:{outputHeight}:flags=fast_bilinear,format=yuv420p",
+                "-c:v", "h264_mediacodec",
+                "-pix_fmt", "yuv420p"
+            ]);
+        }
+
+        args.AddRange([
+            "-b:v", bitrate.ToString(),
+            "-maxrate", bitrate.ToString(),
+            "-bufsize", (bitrate * 2).ToString(),
+            "-g", gopFrames.ToString(CultureInfo.InvariantCulture)
+        ]);
+        AddPreservedEncoderOptions(args, command);
+        AddKeyframeControls(args, command);
+        if (command.AudioRequested)
+        {
+            args.AddRange(["-codec:a:0", RemoteAudioCodec(command.AudioCodec)]);
+            if (!string.IsNullOrWhiteSpace(command.AudioChannels))
+            {
+                args.Add("-ac");
+                args.Add(command.AudioChannels);
+            }
+            if (!string.IsNullOrWhiteSpace(command.AudioBitrate))
+            {
+                args.Add("-ab");
+                args.Add(command.AudioBitrate);
+            }
+            if (!string.IsNullOrWhiteSpace(command.AudioFilter))
+            {
+                args.Add("-af");
+                args.Add(command.AudioFilter);
+            }
+        }
+        else
+        {
+            args.Add("-an");
+        }
+
+        args.AddRange(["-sn", "-dn"]);
+        args.AddRange(RemoteHlsArgs(command));
+        args.Add("{outputRoot}/" + Path.GetFileName(command.OutputPath!));
+        return args;
+    }
+
+    private static IReadOnlyList<string> RemoteHlsArgs(FfmpegCommand command)
+    {
+        var hlsArgs = command.HlsArgs.ToList();
+        hlsArgs.RemoveAll(arg => string.Equals(arg, "-copyts", StringComparison.Ordinal));
+        hlsArgs.RemoveAll(arg => string.Equals(arg, "-start_at_zero", StringComparison.Ordinal));
+        RemoveOptionWithValue(hlsArgs, "-avoid_negative_ts");
+        RemoveOptionWithValue(hlsArgs, "-hls_playlist_type");
+        var segmentIndex = hlsArgs.IndexOf("-hls_segment_filename");
+        if (segmentIndex >= 0 && segmentIndex + 1 < hlsArgs.Count)
+        {
+            hlsArgs[segmentIndex + 1] = "{outputRoot}/" + Path.GetFileName(hlsArgs[segmentIndex + 1]);
+        }
+        var initIndex = hlsArgs.IndexOf("-hls_fmp4_init_filename");
+        if (initIndex >= 0 && initIndex + 1 < hlsArgs.Count)
+        {
+            hlsArgs[initIndex + 1] = Path.GetFileName(hlsArgs[initIndex + 1]);
+        }
+        return HlsArgsWithoutTempFile(hlsArgs);
+    }
+
+    private static string RemoteAudioCodec(string codec) =>
+        string.Equals(codec, "libfdk_aac", StringComparison.OrdinalIgnoreCase) ? "aac" : codec;
 
     private static IReadOnlyList<string> BuildRemoteMpegtsArgs(ShimConfig config, FfmpegCommand command, MediaProbe probe, string? sourceUrl)
     {
@@ -725,32 +1153,36 @@ public static class AndroidTranscode
                 "-ndk_codec", "1"
             ]);
         }
-        if (probe.DurationSeconds > 0)
-        {
-            args.Add("-t");
-            args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
-        }
-        if (!string.IsNullOrWhiteSpace(command.SeekBeforeInput))
-        {
-            args.Add("-ss");
-            args.Add(command.SeekBeforeInput);
-        }
+        AddPreservedInputOptions(args, command, sourceUrl is not null);
+        AddInputStreamDisables(args);
         args.AddRange(["-i", sourceUrl ?? "{input}"]);
-        if (probe.DurationSeconds > 0)
-        {
-            args.Add("-t");
-            args.Add(probe.DurationSeconds.ToString("0.###", CultureInfo.InvariantCulture));
-        }
-        args.AddRange(["-map", "0:v:0"]);
+        AddPreservedVideoMap(args, command);
+        AddPreservedOutputOptions(args, command);
         if (useHardwareDecoder)
         {
+            var tonemap = command.Tonemapx ?? TonemapxOptions.Default;
             args.AddRange([
                 "-c:v", "h264_mediacodec",
                 "-pix_fmt", "mediacodec",
                 "-output_width", outputWidth.ToString(CultureInfo.InvariantCulture),
                 "-output_height", Align16(outputHeight).ToString(CultureInfo.InvariantCulture),
-                "-surface_tonemap", probe.IsHdr ? "1" : "0"
+                "-surface_tonemap", probe.IsHdr ? "1" : "0",
+                "-surface_tonemap_algorithm", tonemap.Algorithm,
+                "-surface_tonemap_transfer", tonemap.Transfer,
+                "-surface_tonemap_matrix", tonemap.Matrix,
+                "-surface_tonemap_primaries", tonemap.Primaries,
+                "-surface_tonemap_range", tonemap.Range,
+                "-surface_tonemap_format", tonemap.Format,
+                "-surface_tonemap_desat", tonemap.Desat
             ]);
+            if (!string.IsNullOrWhiteSpace(tonemap.Param))
+            {
+                args.AddRange(["-surface_tonemap_param", tonemap.Param]);
+            }
+            if (!string.IsNullOrWhiteSpace(tonemap.Peak))
+            {
+                args.AddRange(["-surface_tonemap_peak", tonemap.Peak]);
+            }
         }
         else
         {
@@ -765,6 +1197,8 @@ public static class AndroidTranscode
             "-maxrate", bitrate.ToString(),
             "-bufsize", (bitrate * 2).ToString()
         ]);
+        AddPreservedEncoderOptions(args, command);
+        AddKeyframeControls(args, command);
         args.AddRange([
             "-g", gopFrames.ToString(CultureInfo.InvariantCulture),
             "-an",
@@ -782,6 +1216,137 @@ public static class AndroidTranscode
             ? parsed
             : fallback;
     }
+
+    private static void AddKeyframeControls(List<string> args, FfmpegCommand command)
+    {
+        var forceKeyFrames = command.ValueAfter("-force_key_frames:0") ?? command.ValueAfter("-force_key_frames");
+        if (!string.IsNullOrWhiteSpace(forceKeyFrames))
+        {
+            args.Add("-force_key_frames");
+            args.Add(forceKeyFrames);
+        }
+    }
+
+    private static void AddPreservedInputOptions(List<string> args, FfmpegCommand command, bool seekHandledBySourceUrl)
+    {
+        for (var i = 0; i < command.InputOptions.Count; i++)
+        {
+            var option = command.InputOptions[i];
+            if (seekHandledBySourceUrl && (option == "-ss" || option == "-noaccurate_seek"))
+            {
+                if (OptionTakesValue(option) && i + 1 < command.InputOptions.Count)
+                {
+                    i++;
+                }
+                continue;
+            }
+
+            if (PreservedInputOptions.Contains(option))
+            {
+                args.Add(option);
+                if (OptionTakesValue(option) && i + 1 < command.InputOptions.Count)
+                {
+                    args.Add(command.InputOptions[++i]);
+                }
+            }
+        }
+    }
+
+    private static void AddInputStreamDisables(List<string> args)
+    {
+        args.Add("-sn");
+        args.Add("-dn");
+    }
+
+    private static void AddPreservedMaps(List<string> args, FfmpegCommand command)
+    {
+        if (command.PositiveMaps.Count == 0)
+        {
+            args.AddRange(["-map", "0:v:0"]);
+            if (command.AudioRequested)
+            {
+                args.AddRange(["-map", "0:a:0?"]);
+            }
+            return;
+        }
+
+        foreach (var map in command.PositiveMaps)
+        {
+            args.Add("-map");
+            args.Add(map);
+        }
+    }
+
+    private static void AddPreservedVideoMap(List<string> args, FfmpegCommand command)
+    {
+        var videoMap = command.PositiveMaps.FirstOrDefault(map => map.StartsWith("0:", StringComparison.Ordinal));
+        args.Add("-map");
+        args.Add(videoMap ?? "0:v:0");
+    }
+
+    private static void AddPreservedOutputOptions(List<string> args, FfmpegCommand command)
+    {
+        AddFirstExistingOption(args, command, "-map_metadata");
+        AddFirstExistingOption(args, command, "-map_chapters");
+        AddFirstExistingOption(args, command, "-threads");
+    }
+
+    private static void AddPreservedEncoderOptions(List<string> args, FfmpegCommand command)
+    {
+        AddFirstExistingOption(args, command, "-profile:v:0", "-profile:v");
+        AddFirstExistingOption(args, command, "-level:v:0", "-level:v", "-level");
+        AddFirstExistingOption(args, command, "-g:v:0", "-g:v", "-g");
+        AddFirstExistingOption(args, command, "-keyint_min:v:0", "-keyint_min:v", "-keyint_min");
+    }
+
+    private static void AddFirstExistingOption(List<string> args, FfmpegCommand command, params string[] options)
+    {
+        foreach (var option in options)
+        {
+            var value = command.ValueAfter(option);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                args.Add(option);
+                args.Add(value);
+                return;
+            }
+        }
+    }
+
+    private static void AddNoValueOptionIfPresent(List<string> args, FfmpegCommand command, string option)
+    {
+        if (command.Args.Contains(option) && !args.Contains(option))
+        {
+            args.Add(option);
+        }
+    }
+
+    private static bool OptionTakesValue(string option) =>
+        option is not "-noaccurate_seek" and not "-re";
+
+    private static readonly HashSet<string> PreservedInputOptions = new(StringComparer.Ordinal)
+    {
+        "-analyzeduration",
+        "-probesize",
+        "-ss",
+        "-noaccurate_seek",
+        "-user_agent",
+        "-headers",
+        "-referer",
+        "-rtsp_transport",
+        "-rtsp_flags",
+        "-async",
+        "-fps_mode",
+        "-vsync",
+        "-re",
+        "-readrate",
+        "-fflags",
+        "-f",
+        "-stream_loop",
+        "-reconnect_at_eof",
+        "-reconnect_streamed",
+        "-reconnect_delay_max"
+    };
 
     private static string HlsFlagsWithTempFile(FfmpegCommand command)
     {
@@ -1082,7 +1647,7 @@ public static class SourceUrlSigner
 {
     private static readonly TimeSpan Lifetime = TimeSpan.FromHours(12);
 
-    public static string? TryCreate(ShimConfig config, string inputPath)
+    public static string? TryCreate(ShimConfig config, string inputPath, string? seekBeforeInput)
     {
         if (string.IsNullOrWhiteSpace(config.JellyfinBaseUrl) ||
             string.IsNullOrWhiteSpace(config.SourceSecret) ||
@@ -1099,7 +1664,10 @@ public static class SourceUrlSigner
         var key = Encoding.UTF8.GetBytes(config.SourceSecret);
         var sig = HMACSHA256.HashData(key, payloadBytes);
         var ticket = Base64Url(payloadBytes) + "." + Base64Url(sig);
-        return config.JellyfinBaseUrl.TrimEnd('/') + "/AndroidTranscoder/Source/" + ticket;
+        var url = config.JellyfinBaseUrl.TrimEnd('/') + "/AndroidTranscoder/Source/" + ticket;
+        return string.IsNullOrWhiteSpace(seekBeforeInput)
+            ? url
+            : url + "?ss=" + Uri.EscapeDataString(seekBeforeInput);
     }
 
     private static string Base64Url(byte[] bytes) =>

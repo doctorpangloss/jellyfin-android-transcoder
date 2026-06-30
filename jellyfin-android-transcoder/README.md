@@ -11,13 +11,13 @@ Projects:
 The plugin zip is built by the repository-level release script:
 
 ```bash
-VERSION=1.0.0 ./scripts/package-release.sh
+VERSION=1.1.5 ./scripts/package-release.sh
 ```
 
 Release zip:
 
 ```text
-dist/Jellyfin.Plugin.AndroidTranscoder-1.0.0.zip
+dist/Jellyfin.Plugin.AndroidTranscoder-1.1.5.zip
 ```
 
 Install that zip through Jellyfin's plugin catalog manifest or manually unpack it into Jellyfin's `/config/plugins` volume.

@@ -5,6 +5,8 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
@@ -57,6 +59,7 @@ public class TranscoderService extends Service {
     private static final int MAX_JOBS = 255;
     private static final int PROCESS_TEXT_TAIL_CHARS = 64 * 1024;
     private static final int ANDROID_LOG_CHUNK_CHARS = 3500;
+    private static final long STDOUT_SUBSCRIBER_GRACE_MS = TimeUnit.SECONDS.toMillis(3);
     private static final AtomicInteger ACTIVE_JOBS = new AtomicInteger();
     private static final AtomicInteger ACCEPTED_JOBS = new AtomicInteger();
     private static final AtomicInteger COMPLETED_JOBS = new AtomicInteger();
@@ -325,7 +328,7 @@ public class TranscoderService extends Service {
         reapStaleJob("status");
         JSONObject obj = new JSONObject();
         obj.put("name", "HiddenSwitch Android Transcoder");
-        obj.put("version", "0.1.0");
+        obj.put("version", appVersion());
         ACTIVE_JOBS.set(JOBS.size());
         obj.put("activeJobs", JOBS.size());
         obj.put("acceptedJobs", ACCEPTED_JOBS.get());
@@ -353,6 +356,15 @@ public class TranscoderService extends Service {
                 .put("executables", new JSONArray().put("ffmpeg"))
                 .put("hardware", "mediacodec-gles"));
         return obj;
+    }
+
+    private String appVersion() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return info.versionName == null ? "unknown" : info.versionName;
+        } catch (PackageManager.NameNotFoundException e) {
+            return "unknown";
+        }
     }
 
     private void startRemoteProcess(Request request, HttpServerResponse response) throws Exception {
@@ -495,13 +507,14 @@ public class TranscoderService extends Service {
         response.setStatusCode(200)
                 .putHeader("Content-Type", "application/octet-stream")
                 .setChunked(true);
+        response.write(Buffer.buffer());
         synchronized (job.stdoutSubscribers) {
             job.stdoutSubscribers.add(response);
         }
-        response.exceptionHandler(ex -> removeStdoutSubscriber(job, response));
-        response.closeHandler(ignored -> removeStdoutSubscriber(job, response));
+        response.exceptionHandler(ex -> removeStdoutSubscriber(job, response, true));
+        response.closeHandler(ignored -> removeStdoutSubscriber(job, response, true));
         if (job.processExited) {
-            removeStdoutSubscriber(job, response);
+            removeStdoutSubscriber(job, response, false);
             if (!response.ended()) {
                 response.end();
             }
@@ -867,6 +880,26 @@ public class TranscoderService extends Service {
             }
         }
 
+        void scheduleCancelIfStdoutStillOrphaned(String reason) {
+            Thread cancelThread = new Thread(() -> {
+                try {
+                    Thread.sleep(STDOUT_SUBSCRIBER_GRACE_MS);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+
+                synchronized (stdoutSubscribers) {
+                    if (!stdoutSubscribers.isEmpty() || processExited) {
+                        return;
+                    }
+                }
+                cancel(reason);
+            }, "jfat-stdout-orphan-cancel");
+            cancelThread.setDaemon(true);
+            cancelThread.start();
+        }
+
         JSONObject toJson() throws Exception {
             return toJson(-1, "");
         }
@@ -927,7 +960,6 @@ public class TranscoderService extends Service {
     }
 
     private static void streamProcessStdout(JobState job, Buffer buffer) {
-        appendProcessText(job.stdoutText, buffer.toString(StandardCharsets.UTF_8), false);
         job.stdoutBytes.addAndGet(buffer.length());
         job.touchOutput();
         List<HttpServerResponse> subscribers;
@@ -935,7 +967,7 @@ public class TranscoderService extends Service {
             subscribers = new ArrayList<>(job.stdoutSubscribers);
         }
         for (HttpServerResponse subscriber : subscribers) {
-            subscriber.write(buffer.copy()).onFailure(ex -> removeStdoutSubscriber(job, subscriber));
+            subscriber.write(buffer.copy()).onFailure(ex -> removeStdoutSubscriber(job, subscriber, true));
         }
     }
 
@@ -952,10 +984,19 @@ public class TranscoderService extends Service {
         }
     }
 
-    private static void removeStdoutSubscriber(JobState job, HttpServerResponse subscriber) {
+    private static void removeStdoutSubscriber(JobState job, HttpServerResponse subscriber, boolean cancelIfOrphaned) {
+        boolean shouldCancel = false;
         synchronized (job.stdoutSubscribers) {
             job.stdoutSubscribers.remove(subscriber);
+            shouldCancel = cancelIfOrphaned && job.stdoutSubscribers.isEmpty() && !job.processExited;
         }
+        if (shouldCancel) {
+            job.scheduleCancelIfStdoutStillOrphaned("stdout-disconnected");
+        }
+    }
+
+    static long stdoutSubscriberGraceMillisForTest() {
+        return STDOUT_SUBSCRIBER_GRACE_MS;
     }
 
     private static void appendProcessText(StringBuffer textBuffer, String text, boolean stderr) {

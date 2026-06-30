@@ -5,6 +5,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>Jellyfin.Plugin.AndroidTranscoder</AssemblyName>
+    <Version>1.1.11</Version>
+    <AssemblyVersion>1.1.11.0</AssemblyVersion>
+    <FileVersion>1.1.11.0</FileVersion>
+    <InformationalVersion>1.1.11</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

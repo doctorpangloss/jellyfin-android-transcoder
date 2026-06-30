@@ -50,17 +50,15 @@ JSON
         var exitCode = await Program.Main(JellyfinArgs(input, output));
 
         Assert.Equal(0, exitCode);
-        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
         Assert.Contains("segment0.ts", await File.ReadAllTextAsync(output));
-        Assert.Equal("remuxed-media", await File.ReadAllTextAsync(Path.Combine(_tempDir, "segment0.ts")));
+        Assert.Equal("mpegts-from-android", await File.ReadAllTextAsync(Path.Combine(_tempDir, "segment0.ts")));
 
         var request = await android.GetSingleRequest();
         Assert.Equal("/api/v1/remoteprocesses", request.Path);
         Assert.Equal("Bearer test-token", request.Authorization);
         Assert.Equal("application/octet-stream", request.ContentType);
         Assert.Equal("ffmpeg", request.Executable);
-        Assert.Contains("\"pipe:1\"", request.RemoteArgs);
         Assert.Contains("\"-c:v\",\"hevc_mediacodec\"", request.RemoteArgs);
         Assert.Contains("\"-ndk_codec\",\"1\"", request.RemoteArgs);
         Assert.Contains("\"-hwaccel_output_format\",\"mediacodec\"", request.RemoteArgs);
@@ -68,9 +66,13 @@ JSON
         Assert.Contains("\"-output_width\",\"320\"", request.RemoteArgs);
         Assert.Contains("\"-output_height\",\"192\"", request.RemoteArgs);
         Assert.Contains("\"-g\",\"72\"", request.RemoteArgs);
-        Assert.DoesNotContain("\"-f\",\"hls\"", request.RemoteArgs);
+        Assert.Contains("\"-force_key_frames\",\"expr:gte(t,n_forced*3)\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-sc_threshold\"", request.RemoteArgs);
+        Assert.Contains("\"-f\",\"hls\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_list_size\",\"0\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hls_playlist_type\"", request.RemoteArgs);
         Assert.Equal(1, android.StatusRequestCount);
-        Assert.Equal(2, CountOccurrences(request.RemoteArgs, "\"-t\",\"12.345\""));
+        Assert.Equal(0, CountOccurrences(request.RemoteArgs, "\"-t\""));
         Assert.Equal("placeholder-matroska".Length, request.BodyLength);
         Assert.Equal("placeholder-matroska", Encoding.UTF8.GetString(request.BodyPrefix));
 
@@ -107,13 +109,12 @@ JSON
         await process.WaitForExitAsync();
 
         Assert.Equal(0, process.ExitCode);
-        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
 
         var segment = Path.Combine(_tempDir, "segment0.ts");
         Assert.True(File.Exists(output), "The shim must create Jellyfin's requested HLS playlist path.");
         Assert.True(File.Exists(segment), "The shim must create Jellyfin's requested HLS segment path.");
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
-        Assert.Equal("remuxed-media", await File.ReadAllTextAsync(segment));
+        Assert.Equal("mpegts-chunk-ampegts-chunk-b", await File.ReadAllTextAsync(segment));
 
         var request = await android.GetSingleRequest();
         Assert.Equal(File.ReadAllText(input).Length, request.BodyLength);
@@ -156,6 +157,86 @@ JSON
     }
 
     [Fact]
+    public async Task VodHlsPlaylistIsVisibleBeforeLongRunningRemoteStreamExits()
+    {
+        var ffmpeg = WriteLongRunningVodFfmpeg("fake-ffmpeg-live-vod.sh");
+        var ffprobe = WriteExecutable("fake-ffprobe-live-vod.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "live-vod-ffmpeg.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "HDR Feature Remux-2160p.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("hdr-feature-data-", 4096)));
+        var output = Path.Combine(_tempDir, "livevod.m3u8");
+        var startSegment = Path.Combine(_tempDir, "forcedpgs1963.mp4");
+
+        await using var android = await MockAndroidService.Start(
+            new Dictionary<string, byte[]>
+            {
+                ["forcedpgs1963.mp4"] = "seek-start-segment"u8.ToArray(),
+                ["livevod.m3u8"] = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1963\n#EXTINF:3.000,\nforcedpgs1963.mp4\n"u8.ToArray()
+            },
+            holdFilesStreamOpen: true);
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var shimExecutable = await BuildShimExecutable();
+        var args = ForcedPgsOverlayArgs(input, output);
+        var startIndex = Array.IndexOf(args, "-start_number");
+        args[startIndex + 1] = "1963";
+        using var process = StartShimForControlTest(shimExecutable, args);
+        var stderr = process.StandardError.ReadToEndAsync();
+        await android.WaitForStdoutStream();
+
+        try
+        {
+            var deadline = Stopwatch.StartNew();
+            while (deadline.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                if (File.Exists(output) && (await File.ReadAllTextAsync(output)).Contains("#EXTM3U", StringComparison.Ordinal))
+                {
+                    var request = await android.GetSingleRequest();
+                    Assert.DoesNotContain("\"-hls_flags\",\"temp_file\"", request.RemoteArgs);
+                    Assert.DoesNotContain("\"-hls_playlist_type\"", request.RemoteArgs);
+                    Assert.DoesNotContain("\"-hls_list_size\"", request.RemoteArgs);
+                    Assert.Equal("remuxed-media", await File.ReadAllTextAsync(startSegment));
+                    var playlist = await File.ReadAllTextAsync(output);
+                    Assert.Contains("#EXT-X-MEDIA-SEQUENCE:1963", playlist);
+                    Assert.Contains("forcedpgs1963.mp4", playlist);
+                    var remuxLog = await File.ReadAllTextAsync(ffmpegLog);
+                    Assert.Contains("-hls_list_size 0", remuxLog);
+                    return;
+                }
+                await Task.Delay(100);
+            }
+
+            throw new TimeoutException("Jellyfin VOD playlist was not visible while remote stream was active.");
+        }
+        finally
+        {
+            if (!process.HasExited)
+            {
+                await process.StandardInput.WriteLineAsync("q");
+                await process.StandardInput.FlushAsync();
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                try
+                {
+                    await process.WaitForExitAsync(timeout.Token);
+                }
+                catch
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+        }
+    }
+
+    [Fact]
     public async Task StartupTimeoutDoesNotCancelLongRunningRemoteStreams()
     {
         Environment.SetEnvironmentVariable("JFAT_REMOTE_STARTUP_TIMEOUT_SECONDS", "1");
@@ -182,7 +263,7 @@ JSON
         {
             ["timeout0.ts"] = "mpegts-timeout-window"u8.ToArray(),
             ["timeout.m3u8"] = "#EXTM3U\n#EXTINF:3.000,\ntimeout0.ts\n#EXT-X-ENDLIST\n"u8.ToArray()
-        }, delayStdout: TimeSpan.FromMilliseconds(1500));
+        }, delayFilesAfterReady: TimeSpan.FromMilliseconds(1500));
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var exitCode = await Program.Main([
@@ -194,9 +275,9 @@ JSON
         ]);
 
         Assert.Equal(0, exitCode);
-        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
         Assert.Equal("remuxed-media", await File.ReadAllTextAsync(Path.Combine(_tempDir, "timeout0.ts")));
+        await android.WaitForStdoutStream();
     }
 
     [Fact]
@@ -220,13 +301,13 @@ JSON
 
         await using var android = await MockAndroidService.Start(
             new Dictionary<string, byte[]>(),
-            holdStdoutStreamOpen: true);
+            holdFilesStreamOpen: true);
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var shimExecutable = await BuildShimExecutable();
         using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
         var stderr = process.StandardError.ReadToEndAsync();
-        await android.WaitForStdoutStream();
+        await android.WaitForFilesStream();
         await process.StandardInput.WriteLineAsync("q");
         await process.StandardInput.FlushAsync();
 
@@ -250,6 +331,51 @@ JSON
         Assert.True(
             process.ExitCode == 0 || process.ExitCode == 255,
             $"Unexpected shim exit code {process.ExitCode}; fallback log: {await File.ReadAllTextAsync(ffmpegLog)}; deletes: {string.Join(",", android.DeletePaths)}");
+    }
+
+    [Fact]
+    public async Task JellyfinStopCommandDoesNotStartLocalRemuxChild()
+    {
+        var pidFile = Path.Combine(_tempDir, "remux.pid");
+        var ffmpeg = WriteExecutable("fake-ffmpeg-remux-child.sh", $$"""
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+echo $$ > "{{pidFile}}"
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+""");
+        var ffprobe = WriteExecutable("fake-ffprobe-remux-child.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "remux-child.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "movie-remux-child.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("streaming-input-", 4096)));
+        var output = Path.Combine(_tempDir, "remux-child.m3u8");
+
+        await using var android = await MockAndroidService.Start(
+            new Dictionary<string, byte[]>(),
+            holdFilesStreamOpen: true);
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var shimExecutable = await BuildShimExecutable();
+        using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
+        await android.WaitForFilesStream();
+        Assert.False(File.Exists(pidFile), "The HLS mirror path must not start a local remux child.");
+
+        await process.StandardInput.WriteLineAsync("q");
+        await process.StandardInput.FlushAsync();
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await process.WaitForExitAsync(timeout.Token);
+        Assert.Contains("/api/v1/remoteprocesses/job-1", android.DeletePaths);
     }
 
     [Fact]
@@ -278,13 +404,13 @@ JSON
 
         await using var android = await MockAndroidService.Start(
             new Dictionary<string, byte[]>(),
-            holdStdoutStreamOpen: true);
+            holdFilesStreamOpen: true);
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var shimExecutable = await BuildShimExecutable();
         using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
         var stderr = process.StandardError.ReadToEndAsync();
-        await android.WaitForStdoutStream();
+        await android.WaitForFilesStream();
 
         using (var kill = Process.Start("kill", ["-TERM", process.Id.ToString()])!)
         {
@@ -314,7 +440,7 @@ JSON
     }
 
     [Fact]
-    public async Task InceptionSafariCommandRoutesAsFmp4At1080pSixMegabit()
+    public async Task BrowserFmp4CommandRoutesAsFmp4At1080pSixMegabit()
     {
         var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg.sh");
         var ffprobe = WriteExecutable("fake-ffprobe.sh", """
@@ -328,7 +454,7 @@ JSON
         Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
         await File.WriteAllTextAsync(ffmpegLog, "");
 
-        var input = Path.Combine(_tempDir, "Inception (2010) Remux-2160p.mkv");
+        var input = Path.Combine(_tempDir, "HEVC Feature Remux-2160p.mkv");
         await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("inception-hevc-data-", 1024)));
         var output = Path.Combine(_tempDir, "70e040ca627b1a5a2ecb0618aa77f67c.m3u8");
         var init = Path.Combine(_tempDir, "70e040ca627b1a5a2ecb0618aa77f67c-1.mp4");
@@ -343,12 +469,11 @@ JSON
         });
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
-        var exitCode = await Program.Main(InceptionSafariArgs(input, output));
+        var exitCode = await Program.Main(BrowserFmp4Args(input, output));
 
         Assert.Equal(0, exitCode);
-        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
-        Assert.Equal("remuxed-init", await File.ReadAllTextAsync(init));
-        Assert.Equal("remuxed-media", await File.ReadAllTextAsync(segment));
+        Assert.Equal("fmp4-init", await File.ReadAllTextAsync(init));
+        Assert.Equal("fmp4-media", await File.ReadAllTextAsync(segment));
 
         var request = await android.GetSingleRequest();
         Assert.Equal(1, android.StatusRequestCount);
@@ -364,62 +489,193 @@ JSON
         Assert.DoesNotContain("63810668", request.RemoteArgs);
         Assert.DoesNotContain("127621336", request.RemoteArgs);
         Assert.Contains("\"-c:v\",\"h264_mediacodec\"", request.RemoteArgs);
-        Assert.Contains("\"-f\",\"mpegts\"", request.RemoteArgs);
-        Assert.Contains("\"pipe:1\"", request.RemoteArgs);
-        Assert.DoesNotContain("\"-f\",\"hls\"", request.RemoteArgs);
+        Assert.Contains("\"-f\",\"hls\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_segment_type\",\"fmp4\"", request.RemoteArgs);
+        Assert.Contains("\"-hls_list_size\",\"0\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hls_playlist_type\"", request.RemoteArgs);
     }
 
     [Fact]
-    public async Task RogueOneForcedPgsOverlayCommandStillRoutesVideoThroughAndroid()
+    public async Task ForcedPgsOverlayCommandStillRoutesVideoThroughAndroidAndPreservesAudio()
     {
-        var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-rogue-one.sh");
-        var ffprobe = WriteExecutable("fake-ffprobe-rogue-one.sh", """
+        var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-forced-pgs.sh");
+        var ffprobe = WriteExecutable("fake-ffprobe-forced-pgs.sh", """
 #!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
 {"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"51678189","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"8037.76"}}
 JSON
 """);
-        var ffmpegLog = Path.Combine(_tempDir, "rogue-one-fallback.log");
+        var ffmpegLog = Path.Combine(_tempDir, "forced-pgs-remux.log");
         Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
         await File.WriteAllTextAsync(ffmpegLog, "");
 
-        var input = Path.Combine(_tempDir, "Rogue One A Star Wars Story (2016) Remux-2160p.mkv");
-        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("rogue-one-hevc-data-", 4096)));
-        var output = Path.Combine(_tempDir, "e5b1b7725de32c7ed3db328b4ba6d7e8.m3u8");
-        var init = Path.Combine(_tempDir, "e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4");
-        var segment = Path.Combine(_tempDir, "e5b1b7725de32c7ed3db328b4ba6d7e80.mp4");
+        var input = Path.Combine(_tempDir, "Feature (2026) Remux-2160p.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("feature-hevc-data-", 4096)));
+        var output = Path.Combine(_tempDir, "forcedpgs.m3u8");
+        var init = Path.Combine(_tempDir, "forcedpgs-1.mp4");
+        var segment = Path.Combine(_tempDir, "forcedpgs0.mp4");
 
         await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
         {
-            ["e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4"] = "rogue-fmp4-init"u8.ToArray(),
-            ["e5b1b7725de32c7ed3db328b4ba6d7e80.mp4"] = "rogue-fmp4-media"u8.ToArray(),
-            ["e5b1b7725de32c7ed3db328b4ba6d7e8.m3u8"] =
-                "#EXTM3U\n#EXT-X-MAP:URI=\"e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4\"\n#EXTINF:3.000,\ne5b1b7725de32c7ed3db328b4ba6d7e80.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
+            ["forcedpgs-1.mp4"] = "feature-fmp4-init"u8.ToArray(),
+            ["forcedpgs0.mp4"] = "feature-fmp4-media"u8.ToArray(),
+            ["forcedpgs.m3u8"] =
+                "#EXTM3U\n#EXT-X-MAP:URI=\"forcedpgs-1.mp4\"\n#EXTINF:3.000,\nforcedpgs0.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
         });
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
-        var exitCode = await Program.Main(RogueOneForcedPgsOverlayArgs(input, output));
+        var exitCode = await Program.Main(ForcedPgsOverlayArgs(input, output));
 
         Assert.Equal(0, exitCode);
-        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
         Assert.Equal("remuxed-init", await File.ReadAllTextAsync(init));
         Assert.Equal("remuxed-media", await File.ReadAllTextAsync(segment));
 
         var request = await android.GetSingleRequest();
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
         Assert.Equal("/api/v1/remoteprocesses", request.Path);
         Assert.Equal(1, android.StatusRequestCount);
         Assert.Contains("\"-c:v\",\"hevc_mediacodec\"", request.RemoteArgs);
         Assert.Contains("\"-c:v\",\"h264_mediacodec\"", request.RemoteArgs);
+        AssertOption(remoteArgs, "-sn", null);
+        AssertOption(remoteArgs, "-dn", null);
+        Assert.True(IndexOf(remoteArgs, "-sn") < IndexOf(remoteArgs, "-i"), "Subtitle streams must be disabled before probing the remote input.");
         Assert.Contains("\"-surface_tonemap\",\"1\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_algorithm\",\"bt2390\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_transfer\",\"bt709\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_matrix\",\"bt709\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_primaries\",\"bt709\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_range\",\"tv\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_format\",\"yuv420p\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_desat\",\"0\"", request.RemoteArgs);
+        Assert.Contains("\"-surface_tonemap_peak\",\"100\"", request.RemoteArgs);
         Assert.Contains("\"-output_width\",\"1920\"", request.RemoteArgs);
         Assert.Contains("\"-output_height\",\"1088\"", request.RemoteArgs);
         Assert.Contains("\"-b:v\",\"5616000\"", request.RemoteArgs);
-        Assert.Contains("\"-f\",\"mpegts\"", request.RemoteArgs);
-        Assert.Contains("\"pipe:1\"", request.RemoteArgs);
+        AssertOptionPair(remoteArgs, "-map", "0:0");
+        Assert.DoesNotContain("0:1", remoteArgs);
+        Assert.DoesNotContain("\"0:a:0?\"", request.RemoteArgs);
+        Assert.DoesNotContain("-codec:a:0", remoteArgs);
+        Assert.DoesNotContain("\"libfdk_aac\"", request.RemoteArgs);
+        Assert.DoesNotContain("-ac", remoteArgs);
+        Assert.DoesNotContain("-ab", remoteArgs);
+        Assert.DoesNotContain("-af", remoteArgs);
+        AssertOption(remoteArgs, "-f", "mpegts");
+        Assert.Contains("pipe:1", remoteArgs);
+        Assert.DoesNotContain("-hls_list_size", remoteArgs);
         Assert.DoesNotContain("\"overlay", request.RemoteArgs);
         Assert.DoesNotContain("\"-filter_complex\"", request.RemoteArgs);
-        Assert.DoesNotContain("\"-f\",\"hls\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-hls_playlist_type\"", request.RemoteArgs);
+        await android.WaitForStdoutStream();
+        var remuxLog = await File.ReadAllTextAsync(ffmpegLog);
+        Assert.Contains("-codec:a:0 libfdk_aac", remuxLog);
+        Assert.Contains("-af volume=2", remuxLog);
+        Assert.Contains("-hls_segment_type fmp4", remuxLog);
+    }
+
+    [Fact]
+    public async Task JellyfinGeneratedFlagsAreForwardedToRemoteProcess()
+    {
+        var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-preserve-flags.sh");
+        var ffprobe = WriteExecutable("fake-ffprobe-preserve-flags.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "preserve-flags-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "HDR Feature Remux-2160p.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("hdr-feature-data-", 4096)));
+        var output = Path.Combine(_tempDir, "preserveflags.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["preserveflags-1.mp4"] = "fmp4-init"u8.ToArray(),
+            ["preserveflags2065.mp4"] = "fmp4-media"u8.ToArray(),
+            ["preserveflags.m3u8"] =
+                "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:2065\n#EXT-X-MAP:URI=\"preserveflags-1.mp4\"\n#EXTINF:3.000,\npreserveflags2065.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var args = ForcedPgsOverlayArgs(input, output);
+        args[Array.IndexOf(args, "-start_number") + 1] = "2065";
+        args[Array.IndexOf(args, "-hls_fmp4_init_filename") + 1] = "preserveflags-1.mp4";
+        args[Array.IndexOf(args, "-hls_segment_filename") + 1] = Path.Combine(_tempDir, "preserveflags%d.mp4");
+        var exitCode = await Program.Main(args);
+
+        Assert.Equal(0, exitCode);
+        var request = await android.GetSingleRequest();
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
+
+        AssertOption(remoteArgs, "-analyzeduration", "200M");
+        AssertOption(remoteArgs, "-probesize", "1G");
+        AssertOptionPair(remoteArgs, "-map", "0:0");
+        Assert.DoesNotContain("0:1", remoteArgs);
+        AssertOption(remoteArgs, "-map_metadata", "-1");
+        AssertOption(remoteArgs, "-map_chapters", "-1");
+        AssertOption(remoteArgs, "-threads", "0");
+        AssertOption(remoteArgs, "-profile:v:0", "high");
+        AssertOption(remoteArgs, "-level", "51");
+        AssertOption(remoteArgs, "-force_key_frames", "expr:gte(t,n_forced*3)");
+        Assert.DoesNotContain("-sc_threshold", remoteArgs);
+        Assert.DoesNotContain("-copyts", remoteArgs);
+        Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
+        Assert.DoesNotContain("-start_at_zero", remoteArgs);
+        Assert.DoesNotContain("-max_muxing_queue_size", remoteArgs);
+        Assert.DoesNotContain("-max_delay", remoteArgs);
+        Assert.DoesNotContain("-hls_fmp4_init_filename", remoteArgs);
+        Assert.DoesNotContain("-start_number", remoteArgs);
+        Assert.DoesNotContain("-hls_segment_options", remoteArgs);
+        AssertOption(remoteArgs, "-sn", null);
+        Assert.True(IndexOf(remoteArgs, "-sn") < IndexOf(remoteArgs, "-i"), "Subtitle streams must be disabled before probing the remote input.");
+        AssertOption(remoteArgs, "-f", "mpegts");
+        Assert.Contains("pipe:1", remoteArgs);
+        Assert.DoesNotContain("0:a:0?", remoteArgs);
+        Assert.DoesNotContain("-preset", remoteArgs);
+        Assert.DoesNotContain("-crf", remoteArgs);
+        Assert.DoesNotContain("-x264opts:0", remoteArgs);
+    }
+
+    [Fact]
+    public async Task RemoteCommandDoesNotInventDurationLimitWhenJellyfinDidNotRequestOne()
+    {
+        var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-no-synthetic-duration.sh");
+        var ffprobe = WriteExecutable("fake-ffprobe-no-synthetic-duration.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "no-synthetic-duration-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "duration-source.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("duration-source-data-", 4096)));
+        var output = Path.Combine(_tempDir, "duration.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["duration0.mp4"] = "duration-fmp4-media"u8.ToArray(),
+            ["duration.m3u8"] = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:3.000,\nduration0.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var args = BrowserFmp4Args(input, output);
+        args[Array.IndexOf(args, "-hls_segment_filename") + 1] = Path.Combine(_tempDir, "duration%d.mp4");
+        var exitCode = await Program.Main(args);
+
+        Assert.Equal(0, exitCode);
+        var request = await android.GetSingleRequest();
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
+        Assert.DoesNotContain("-t", remoteArgs);
+        AssertOption(remoteArgs, "-i", "{input}");
+        AssertOption(remoteArgs, "-hls_time", "3");
     }
 
     [Fact]
@@ -463,13 +719,74 @@ JSON
         ]);
 
         Assert.Equal(0, exitCode);
-        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
         var request = await android.GetSingleRequest();
-        Assert.Contains("\"-ss\",\"00:00:33.000\",\"-i\",\"{input}\"", request.RemoteArgs);
-        Assert.Contains("\"-ss\",\"00:00:33.000\"", request.RemoteArgs);
-        Assert.Contains("\"-g\",\"72\"", request.RemoteArgs);
-        Assert.Contains("\"-hwaccel\",\"mediacodec\"", request.RemoteArgs);
-        Assert.Contains("\"-c:v\",\"h264_mediacodec\"", request.RemoteArgs);
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
+        AssertOption(remoteArgs, "-ss", "00:00:33.000");
+        Assert.True(IndexOf(remoteArgs, "-ss") < IndexOf(remoteArgs, "-i"), "Jellyfin's input seek must stay before the Android input.");
+        AssertOption(remoteArgs, "-g", "72");
+        AssertOption(remoteArgs, "-f", "mpegts");
+        Assert.Contains("pipe:1", remoteArgs);
+        Assert.DoesNotContain("-start_number", remoteArgs);
+        Assert.DoesNotContain("-hls_list_size", remoteArgs);
+        Assert.DoesNotContain("-hls_segment_type", remoteArgs);
+        Assert.DoesNotContain("-hls_segment_filename", remoteArgs);
+        Assert.DoesNotContain("-hls_playlist_type", remoteArgs);
+        AssertOption(remoteArgs, "-hwaccel", "mediacodec");
+        AssertOptionPair(remoteArgs, "-c:v", "h264_mediacodec");
+        await android.WaitForStdoutStream();
+        Assert.Contains("-start_number 11", await File.ReadAllTextAsync(ffmpegLog));
+    }
+
+    [Fact]
+    public async Task JellyfinSeekFlagsArePreservedWhenUploadingInputStream()
+    {
+        var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-preserve-seek.sh");
+        var ffprobe = WriteExecutable("fake-ffprobe-preserve-seek.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"60000000","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"7200"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "seek-input-fallback.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "seek-input.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("seek-input-data-", 4096)));
+        var output = Path.Combine(_tempDir, "seek-input.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["seek-input11.mp4"] = "seeked-fmp4-media"u8.ToArray(),
+            ["seek-input.m3u8"] = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:11\n#EXTINF:3.000,\nseek-input11.mp4\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main([
+            "-analyzeduration", "200M", "-probesize", "1G", "-ss", "00:00:33.000", "-noaccurate_seek", "-i", $"file:{input}",
+            "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+            "-map", "0:0", "-codec:v:0", "libx264", "-maxrate", "6000000", "-bufsize", "12000000",
+            "-force_key_frames:0", "expr:gte(t,n_forced*3)", "-sc_threshold:v:0", "0",
+            "-vf", @"scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2,format=yuv420p",
+            "-copyts", "-avoid_negative_ts", "disabled", "-start_at_zero", "-max_muxing_queue_size", "2048",
+            "-f", "hls", "-max_delay", "5000000", "-hls_time", "3", "-hls_segment_type", "fmp4",
+            "-start_number", "11", "-hls_segment_filename", Path.Combine(_tempDir, "seek-input%d.mp4"),
+            "-hls_playlist_type", "vod", "-hls_list_size", "0", "-y", output
+        ]);
+
+        Assert.Equal(0, exitCode);
+        var request = await android.GetSingleRequest();
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
+        AssertOption(remoteArgs, "-analyzeduration", "200M");
+        AssertOption(remoteArgs, "-probesize", "1G");
+        AssertOption(remoteArgs, "-ss", "00:00:33.000");
+        AssertOption(remoteArgs, "-noaccurate_seek", null);
+        Assert.True(IndexOf(remoteArgs, "-ss") < IndexOf(remoteArgs, "-i"), "Jellyfin's input seek must stay before the Android input.");
+        AssertOption(remoteArgs, "-start_number", "11");
+        Assert.DoesNotContain("-copyts", remoteArgs);
+        Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
+        Assert.DoesNotContain("-start_at_zero", remoteArgs);
     }
 
     [Fact]
@@ -540,7 +857,11 @@ JSON
         await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("should-not-upload-", 4096)));
         var output = Path.Combine(_tempDir, "source-url.m3u8");
 
-        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>());
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>
+        {
+            ["source0.ts"] = "source-url-segment"u8.ToArray(),
+            ["source-url.m3u8"] = "#EXTM3U\n#EXTINF:3.000,\nsource0.ts\n#EXT-X-ENDLIST\n"u8.ToArray()
+        });
         WriteConfig(
             android.BaseUrl,
             android.Token,
@@ -551,7 +872,7 @@ JSON
             sourceSecret: "test-source-secret");
 
         var exitCode = await Program.Main([
-            "-ss", "00:00:30.000", "-i", $"file:{input}",
+            "-analyzeduration", "200M", "-probesize", "1G", "-ss", "00:00:30.000", "-noaccurate_seek", "-i", $"file:{input}",
             "-codec:v:0", "libx264", "-maxrate", "6000000", "-bufsize", "12000000",
             "-force_key_frames:0", "expr:gte(t,n_forced*3)",
             "-vf", @"scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2",
@@ -562,10 +883,17 @@ JSON
 
         Assert.Equal(0, exitCode);
         var request = await android.GetSingleRequest();
-        Assert.Contains("\"-ss\",\"00:00:30.000\",\"-i\",\"http://jellyfin.example.test/AndroidTranscoder/Source/", request.RemoteArgs);
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
+        AssertOption(remoteArgs, "-analyzeduration", "200M");
+        AssertOption(remoteArgs, "-probesize", "1G");
+        Assert.Contains("\"-i\",\"http://jellyfin.example.test/AndroidTranscoder/Source/", request.RemoteArgs);
+        Assert.Contains("ss=00%3A00%3A30.000", request.RemoteArgs);
+        Assert.DoesNotContain("\"-ss\",\"00:00:30.000\",\"-i\",\"http://jellyfin.example.test/AndroidTranscoder/Source/", request.RemoteArgs);
+        Assert.DoesNotContain("-noaccurate_seek", remoteArgs);
         Assert.DoesNotContain("\"-i\",\"{input}\"", request.RemoteArgs);
         Assert.Equal(0, request.BodyLength);
         Assert.Equal("remuxed-media", await File.ReadAllTextAsync(Path.Combine(_tempDir, "source0.ts")));
+        await android.WaitForStdoutStream();
     }
 
     [Fact]
@@ -605,10 +933,9 @@ JSON
         ]);
 
         Assert.Equal(0, exitCode);
-        Assert.Contains("pipe:0", await File.ReadAllTextAsync(ffmpegLog));
         Assert.Equal(2, android.RequestCount);
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
-        Assert.Equal("remuxed-media", await File.ReadAllTextAsync(Path.Combine(_tempDir, "retry0.mp4")));
+        Assert.Equal("fmp4-media-after-retry", await File.ReadAllTextAsync(Path.Combine(_tempDir, "retry0.mp4")));
     }
 
     [Fact]
@@ -637,10 +964,10 @@ JSON
 
         await using var android = await MockAndroidService.Start(
             new Dictionary<string, byte[]>(),
-            failStdoutStream: true);
+            failFilesStream: true);
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
-        var exitCode = await Program.Main(InceptionSafariArgs(input, output));
+        var exitCode = await Program.Main(BrowserFmp4Args(input, output));
 
         Assert.Equal(42, exitCode);
         Assert.Contains("/api/v1/remoteprocesses/job-1", android.DeletePaths);
@@ -758,6 +1085,75 @@ exit 0
 """);
     }
 
+    private string WriteLongRunningVodFfmpeg(string name)
+    {
+        return WriteExecutable(name, """
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JFAT_FAKE_FFMPEG_LOG"
+args=("$@")
+out="${args[$((${#args[@]} - 1))]}"
+segment_pattern=""
+init_name=""
+start_number="0"
+hls_flags=""
+playlist_type=""
+list_size=""
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    -hls_segment_filename) segment_pattern="${args[$((i+1))]}" ;;
+    -hls_fmp4_init_filename) init_name="${args[$((i+1))]}" ;;
+    -start_number) start_number="${args[$((i+1))]}" ;;
+    -hls_flags) hls_flags="${args[$((i+1))]}" ;;
+    -hls_playlist_type) playlist_type="${args[$((i+1))]}" ;;
+    -hls_list_size) list_size="${args[$((i+1))]}" ;;
+  esac
+done
+mkdir -p "$(dirname "$out")"
+if [[ -z "$segment_pattern" ]]; then
+  segment_pattern="${out%.m3u8}%d.mp4"
+fi
+segment="${segment_pattern/\%d/$start_number}"
+mkdir -p "$(dirname "$segment")"
+if [[ -z "$init_name" ]]; then
+  init_name="$(basename "${out%.m3u8}")-1.mp4"
+fi
+if [[ "$init_name" = /* ]]; then
+  init_path="$init_name"
+else
+  init_path="$(dirname "$out")/$init_name"
+fi
+printf 'remuxed-init' > "$init_path"
+printf 'remuxed-media' > "$segment"
+second_number="$((start_number + 1))"
+second_segment="${segment_pattern/\%d/$second_number}"
+printf 'remuxed-media-2' > "$second_segment"
+media_sequence="$start_number"
+if [[ "$list_size" != "0" ]]; then
+  media_sequence="$second_number"
+fi
+playlist_target="$out"
+if [[ "$playlist_type" == "vod" && "$hls_flags" == *"temp_file"* ]]; then
+  playlist_target="$out.tmp"
+fi
+cat > "$playlist_target" <<EOF
+#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:$media_sequence
+#EXT-X-MAP:URI="$(basename "$init_path")"
+#EXTINF:3.000,
+$(basename "$segment")
+EOF
+if [[ "$list_size" == "0" ]]; then
+cat >> "$playlist_target" <<EOF
+#EXTINF:3.000,
+$(basename "$second_segment")
+EOF
+fi
+cat >/dev/null
+exit 0
+""");
+    }
+
     private static int CountOccurrences(string text, string value)
     {
         var count = 0;
@@ -768,6 +1164,56 @@ exit 0
             index += value.Length;
         }
         return count;
+    }
+
+    private static void AssertOption(IReadOnlyList<string> args, string option, string? value)
+    {
+        var index = Array.IndexOf(args.ToArray(), option);
+        Assert.True(index >= 0, $"Expected remote args to contain {option}. Args: {JsonSerializer.Serialize(args)}");
+        if (value is not null)
+        {
+            Assert.True(index + 1 < args.Count, $"Expected {option} to have value {value}. Args: {JsonSerializer.Serialize(args)}");
+            Assert.Equal(value, args[index + 1]);
+        }
+    }
+
+    private static void AssertOptionPair(IReadOnlyList<string> args, string option, string value)
+    {
+        for (var i = 0; i + 1 < args.Count; i++)
+        {
+            if (args[i] == option && args[i + 1] == value)
+            {
+                return;
+            }
+        }
+
+        Assert.Fail($"Expected remote args to contain {option} {value}. Args: {JsonSerializer.Serialize(args)}");
+    }
+
+    private static int IndexOf(IReadOnlyList<string> args, string value)
+    {
+        for (var i = 0; i < args.Count; i++)
+        {
+            if (args[i] == value)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool ProcessExists(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private void WriteConfig(string androidBaseUrl, string token, string ffmpeg, string ffprobe, int maxBitrate, string jellyfinBaseUrl = "", string sourceSecret = "", bool hardwareCodecs = true)
@@ -806,7 +1252,7 @@ exit 0
         "-y", output
     ];
 
-    private static string[] InceptionSafariArgs(string input, string output) =>
+    private static string[] BrowserFmp4Args(string input, string output) =>
     [
         "-analyzeduration", "200M", "-probesize", "1G", "-i", $"file:{input}",
         "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
@@ -825,7 +1271,7 @@ exit 0
         "-hls_segment_options", "movflags=+frag_discont", "-y", output
     ];
 
-    private static string[] RogueOneForcedPgsOverlayArgs(string input, string output) =>
+    private static string[] ForcedPgsOverlayArgs(string input, string output) =>
     [
         "-analyzeduration", "200M", "-probesize", "1G", "-i", $"file:{input}",
         "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
@@ -839,9 +1285,9 @@ exit 0
         "-start_at_zero", "-codec:a:0", "libfdk_aac", "-ac", "2", "-ab", "256000", "-af", "volume=2",
         "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
         "-f", "hls", "-max_delay", "5000000", "-hls_time", "3",
-        "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "e5b1b7725de32c7ed3db328b4ba6d7e8-1.mp4",
+        "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "forcedpgs-1.mp4",
         "-start_number", "0", "-hls_segment_filename",
-        Path.Combine(Path.GetDirectoryName(output)!, "e5b1b7725de32c7ed3db328b4ba6d7e8%d.mp4"),
+        Path.Combine(Path.GetDirectoryName(output)!, "forcedpgs%d.mp4"),
         "-hls_playlist_type", "vod", "-hls_list_size", "0",
         "-hls_segment_options", "movflags=+frag_discont", "-y", output
     ];
@@ -1161,6 +1607,16 @@ exit 0
                     {
                         await Task.Delay(_delayFilesAfterReady);
                     }
+                    foreach (var file in _files)
+                    {
+                        var partHeaders = Encoding.ASCII.GetBytes(
+                            $"--{boundary}\r\nContent-Type: application/octet-stream\r\nX-Remote-Event: upsert\r\nX-Remote-Path: {file.Key}\r\nContent-Length: {file.Value.Length}\r\n\r\n");
+                        await context.Response.OutputStream.WriteAsync(partHeaders);
+                        await context.Response.OutputStream.WriteAsync(file.Value);
+                        await context.Response.OutputStream.WriteAsync("\r\n"u8.ToArray());
+                        await context.Response.OutputStream.FlushAsync();
+                        await Task.Delay(10);
+                    }
                     if (_holdFilesStreamOpen)
                     {
                         _ = Task.Run(async () =>
@@ -1172,16 +1628,6 @@ exit 0
                             context.Response.Close();
                         });
                         continue;
-                    }
-                    foreach (var file in _files)
-                    {
-                        var partHeaders = Encoding.ASCII.GetBytes(
-                            $"--{boundary}\r\nContent-Type: application/octet-stream\r\nX-Remote-Event: upsert\r\nX-Remote-Path: {file.Key}\r\nContent-Length: {file.Value.Length}\r\n\r\n");
-                        await context.Response.OutputStream.WriteAsync(partHeaders);
-                        await context.Response.OutputStream.WriteAsync(file.Value);
-                        await context.Response.OutputStream.WriteAsync("\r\n"u8.ToArray());
-                        await context.Response.OutputStream.FlushAsync();
-                        await Task.Delay(10);
                     }
                     var exit = Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\nContent-Length: 14\r\n\r\n{{\"exitCode\":0}}\r\n--{boundary}--\r\n");
                     await context.Response.OutputStream.WriteAsync(exit);
@@ -1218,6 +1664,8 @@ exit 0
                             {
                                 while (_listener.IsListening)
                                 {
+                                    await context.Response.OutputStream.WriteAsync("remote-mpegts-stdout"u8.ToArray());
+                                    await context.Response.OutputStream.FlushAsync();
                                     await Task.Delay(100);
                                 }
                                 context.Response.Close();

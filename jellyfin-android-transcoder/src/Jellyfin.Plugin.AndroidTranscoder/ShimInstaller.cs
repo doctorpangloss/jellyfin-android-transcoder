@@ -13,9 +13,7 @@ internal static class ShimInstaller
             throw new FileNotFoundException($"Shim payload not found at {source}. Publish JellyfinAndroidTranscoder.Shim and copy jfat-ffmpeg into shim-payload.", source);
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(config.ShimPath)!);
-        File.Copy(source, config.ShimPath, overwrite: true);
-        MakeExecutable(config.ShimPath);
+        InstallExecutable(source, config.ShimPath);
         InstallFfprobeWrapper(config);
         WriteShimConfig(config);
     }
@@ -74,5 +72,27 @@ internal static class ShimInstaller
 
         using var process = Process.Start("chmod", ["755", path]);
         process?.WaitForExit();
+    }
+
+    private static void InstallExecutable(string source, string target)
+    {
+        var directory = Path.GetDirectoryName(target)
+            ?? throw new InvalidOperationException("Shim path must include a directory");
+        Directory.CreateDirectory(directory);
+
+        var temp = Path.Combine(directory, $".{Path.GetFileName(target)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            File.Copy(source, temp, overwrite: false);
+            MakeExecutable(temp);
+            File.Move(temp, target, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                File.Delete(temp);
+            }
+        }
     }
 }

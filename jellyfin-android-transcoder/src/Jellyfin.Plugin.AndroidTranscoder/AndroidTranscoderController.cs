@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -100,6 +101,11 @@ public sealed class AndroidTranscoderController : ControllerBase
         var config = plugin.Configuration;
         config.Enabled = Request.Form.ContainsKey("enabled");
         config.UseHardwareCodecs = Request.Form.ContainsKey("hardware");
+        var jellyfinBaseUrl = SourceSettings.NormalizeBaseUrl(Request.Form["jellyfinBaseUrl"].ToString());
+        if (!string.IsNullOrWhiteSpace(jellyfinBaseUrl))
+        {
+            config.JellyfinBaseUrl = jellyfinBaseUrl;
+        }
         SourceSettings.Ensure(config, _configurationManager, RequestBaseUrl());
         plugin.SaveConfiguration(config);
         ShimInstaller.WriteShimConfig(config);
@@ -218,7 +224,7 @@ public sealed class AndroidTranscoderController : ControllerBase
 
     [AllowAnonymous]
     [HttpGet("Source/{ticket}")]
-    public IActionResult Source(string ticket)
+    public IActionResult Source(string ticket, [FromQuery] string? ss = null)
     {
         var config = CurrentConfig();
         if (string.IsNullOrWhiteSpace(config.SourceSecret))
@@ -242,7 +248,64 @@ public sealed class AndroidTranscoderController : ControllerBase
             return Forbid();
         }
 
+        if (!string.IsNullOrWhiteSpace(ss))
+        {
+            var process = StartSeekedSourceProcess(config.RealFfmpegPath, path, ss);
+            Response.OnCompleted(() =>
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                }
+                catch
+                {
+                }
+                process.Dispose();
+                return Task.CompletedTask;
+            });
+            return File(process.StandardOutput.BaseStream, "application/octet-stream");
+        }
+
         return PhysicalFile(path, "application/octet-stream", enableRangeProcessing: true);
+    }
+
+    private static Process StartSeekedSourceProcess(string ffmpegPath, string path, string seek)
+    {
+        var start = new ProcessStartInfo(ffmpegPath)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        foreach (var arg in new[]
+        {
+            "-hide_banner", "-loglevel", "error",
+            "-ss", seek,
+            "-i", "file:" + path,
+            "-map", "0",
+            "-c", "copy",
+            "-f", "matroska",
+            "pipe:1"
+        })
+        {
+            start.ArgumentList.Add(arg);
+        }
+
+        var process = Process.Start(start) ?? throw new InvalidOperationException("Failed to start source ffmpeg.");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await process.StandardError.ReadToEndAsync();
+            }
+            catch
+            {
+            }
+        });
+        return process;
     }
 
     [HttpPost("Test")]
@@ -526,6 +589,7 @@ public sealed class AndroidTranscoderController : ControllerBase
         var escapedDetail = Html(statusDetail);
         var escapedPairingUrl = Html(pairingUrl);
         var escapedAndroidUrl = Html(config.AndroidBaseUrl);
+        var escapedJellyfinUrl = Html(config.JellyfinBaseUrl);
         var enabledChecked = config.Enabled ? " checked" : string.Empty;
         var hardwareChecked = config.UseHardwareCodecs ? " checked" : string.Empty;
 
@@ -573,6 +637,7 @@ public sealed class AndroidTranscoderController : ControllerBase
         </div>
         <p>Pairing URL: <br /><code>{{escapedPairingUrl}}</code></p>
         <p>Configured phone: <br /><a href="{{escapedAndroidUrl}}">{{escapedAndroidUrl}}</a></p>
+        <p>Jellyfin source URL for the phone: <br /><code>{{escapedJellyfinUrl}}</code></p>
         <div class="actions">
           <form action="/AndroidTranscoder/Page" method="get"><button type="submit">Refresh status</button></form>
           <form action="/AndroidTranscoder/NewPairing" method="get"><button type="submit" class="secondary">New pairing code</button></form>
@@ -593,6 +658,9 @@ public sealed class AndroidTranscoderController : ControllerBase
       <form action="/AndroidTranscoder/Options" method="post">
         <label><input type="checkbox" name="enabled" value="true"{{enabledChecked}} />Use this phone for video transcodes</label>
         <label><input type="checkbox" name="hardware" value="true"{{hardwareChecked}} />Use Android hardware codecs</label>
+        <label>Jellyfin source URL reachable by the phone
+          <input type="url" name="jellyfinBaseUrl" value="{{escapedJellyfinUrl}}" placeholder="http://192.168.88.210:8096" />
+        </label>
         <button type="submit">Save options</button>
       </form>
     </section>

@@ -15,32 +15,107 @@ internal static class SourceSettings
             changed = true;
         }
 
+        var inferred = InferredBaseUrl(configurationManager, requestBaseUrl);
         if (string.IsNullOrWhiteSpace(config.JellyfinBaseUrl))
         {
-            var inferred = PublishedServerUrl(configurationManager) ?? NormalizeBaseUrl(requestBaseUrl);
             if (!string.IsNullOrWhiteSpace(inferred))
             {
                 config.JellyfinBaseUrl = inferred;
                 changed = true;
             }
         }
+        else if (ShouldReplace(config.JellyfinBaseUrl, inferred))
+        {
+            config.JellyfinBaseUrl = inferred!;
+            changed = true;
+        }
 
         return changed;
     }
 
-    private static string? PublishedServerUrl(IConfigurationManager configurationManager)
+    public static string? NormalizeBaseUrl(string? value)
     {
-        var network = configurationManager.GetNetworkConfiguration();
-        foreach (var raw in network.PublishedServerUriBySubnet ?? [])
+        if (string.IsNullOrWhiteSpace(value))
         {
-            var candidate = ExtractPublishedUri(raw);
-            if (candidate is not null)
-            {
-                return candidate;
-            }
+            return null;
         }
 
-        return NormalizeBaseUrl(network.BaseUrl);
+        var trimmed = value.Trim().TrimEnd('/');
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return null;
+        }
+
+        return trimmed;
+    }
+
+    private static string? InferredBaseUrl(IConfigurationManager configurationManager, string? requestBaseUrl)
+    {
+        var network = configurationManager.GetNetworkConfiguration();
+        var candidates = (network.PublishedServerUriBySubnet ?? [])
+            .Select(ExtractPublishedUri)
+            .Append(NormalizeBaseUrl(requestBaseUrl))
+            .Append(NormalizeBaseUrl(network.BaseUrl))
+            .Where(candidate => !string.IsNullOrWhiteSpace(candidate))
+            .Cast<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return candidates.Where(IsHttpUrl).FirstOrDefault(IsPublicHost) ??
+               candidates.Where(IsHttpUrl).FirstOrDefault(candidate => !IsIpHost(candidate)) ??
+               candidates.FirstOrDefault(IsHttpUrl) ??
+               candidates.FirstOrDefault(IsPublicHost) ??
+               candidates.FirstOrDefault(candidate => !IsIpHost(candidate)) ??
+               candidates.FirstOrDefault();
+    }
+
+    private static bool ShouldReplace(string current, string? inferred)
+    {
+        if (string.IsNullOrWhiteSpace(inferred))
+        {
+            return false;
+        }
+
+        if (IsPublicHost(current))
+        {
+            return false;
+        }
+
+        if (IsHttpUrl(current) && !IsHttpUrl(inferred))
+        {
+            return false;
+        }
+
+        return IsPublicHost(inferred) || (IsIpHost(current) && !IsIpHost(inferred));
+    }
+
+    private static bool IsHttpUrl(string? value) =>
+        Uri.TryCreate(value?.Trim(), UriKind.Absolute, out var uri) &&
+        uri.Scheme == Uri.UriSchemeHttp;
+
+    private static bool IsIpHost(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) ||
+            !Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri))
+        {
+            return false;
+        }
+
+        return System.Net.IPAddress.TryParse(uri.Host, out _);
+    }
+
+    private static bool IsPublicHost(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) ||
+            !Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri))
+        {
+            return false;
+        }
+
+        return !System.Net.IPAddress.TryParse(uri.Host, out _) &&
+               !string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase) &&
+               uri.Host.Contains('.', StringComparison.Ordinal);
     }
 
     private static string? ExtractPublishedUri(string? raw)
@@ -58,22 +133,5 @@ internal static class SourceSettings
         }
 
         return NormalizeBaseUrl(value);
-    }
-
-    private static string? NormalizeBaseUrl(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return null;
-        }
-
-        var trimmed = value.Trim().TrimEnd('/');
-        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) ||
-            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
-        {
-            return null;
-        }
-
-        return trimmed;
     }
 }
