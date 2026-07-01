@@ -32,10 +32,10 @@ The input was a local 4K HEVC 10-bit remux sample. The benchmark command was Jel
 | --- | --- | ---: | ---: | ---: | --- |
 | 4K HEVC10 SDR -> 1080p H.264 | V1500B software `libx264` | 25.835 s | 30 s | 1.16x | Real-time on this sample. |
 | 4K HEVC10 SDR -> 1080p H.264 | Android MediaCodec | 25.069 s | 27 s | 1.08x | Real-time, but close to the V1500B because network/source/HLS overhead dominates. |
-| 4K HEVC10 HDR10 -> 1080p H.264 SDR | V1500B software tone map + `libx264` | 26.546 s | 18 s | 0.68x | Not real-time. |
-| 4K HEVC10 HDR10 -> 1080p H.264 SDR | Android MediaCodec + GLES surface tonemap | 60.100 s | 21 s | 0.35x | Not ready for real-time; first 25 s produced no full HLS segment on this sample. |
+| 4K HEVC10 HDR10 -> 1080p H.264 SDR | V1500B software tone map + `libx264` | 61.546 s | 42 s | 0.68x | Not real-time; first HLS segment at 9.3 s. |
+| 4K HEVC10 HDR10 -> 1080p H.264 SDR | Android MediaCodec + GLES surface tonemap | 60.043 s | 72 s | 1.20x | Real-time once started; first HLS segment at 15.6 s. |
 
-Interpretation: the Android path is viable for simple SDR HEVC transcodes, but the current HDR surface-tonemap path needs more work before it can replace local fallback. PGS/image subtitle burn-in is also not accelerated by this release; avoid burn-in or use client-rendered/text subtitles for the Android path.
+Interpretation: the Android path is viable for SDR HEVC transcodes and can beat the V1500B software path for HDR10 tone-map work when it uses the video-only MPEG-TS stdout/remux path. Startup latency is still higher on the Android HDR path, and PGS/image subtitle burn-in is not accelerated by this release; avoid burn-in or use client-rendered/text subtitles for the Android path.
 
 ## Job Liveness
 
