@@ -174,12 +174,6 @@ public sealed class AndroidTranscoderController : ControllerBase
             !string.Equals(config.PairingCode, code, StringComparison.Ordinal) ||
             config.PairingCodeExpiresUtc < DateTime.UtcNow)
         {
-            var idempotent = await TryCompleteAlreadyPairedRequest(config, posted);
-            if (idempotent is not null)
-            {
-                return idempotent;
-            }
-
             return Unauthorized(new { ok = false, error = "pairing_code_invalid_or_expired" });
         }
 
@@ -471,42 +465,6 @@ public sealed class AndroidTranscoderController : ControllerBase
         }
 
         return null;
-    }
-
-    private async Task<ActionResult<object>?> TryCompleteAlreadyPairedRequest(
-        PluginConfiguration config,
-        AndroidConnectionConfig posted)
-    {
-        if (!config.Enabled ||
-            string.IsNullOrWhiteSpace(config.AndroidBaseUrl) ||
-            string.IsNullOrWhiteSpace(config.Token) ||
-            !string.Equals(posted.Token, config.Token, StringComparison.Ordinal))
-        {
-            return null;
-        }
-
-        var candidates = new List<string>();
-        if (!string.IsNullOrWhiteSpace(posted.BaseUrl))
-        {
-            candidates.Add(posted.BaseUrl);
-        }
-        if (posted.AllBaseUrls is not null)
-        {
-            candidates.AddRange(posted.AllBaseUrls.Where(url => !string.IsNullOrWhiteSpace(url)));
-        }
-        if (candidates.Count == 0)
-        {
-            candidates.Add(config.AndroidBaseUrl);
-        }
-
-        var reachable = await FirstReachableAndroidUrl(candidates.Distinct(StringComparer.OrdinalIgnoreCase), config.Token);
-        if (string.IsNullOrWhiteSpace(reachable) ||
-            !string.Equals(reachable.TrimEnd('/'), config.AndroidBaseUrl.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-
-        return PairingSuccess(config);
     }
 
     private static object PairingSuccess(PluginConfiguration config)

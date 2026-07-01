@@ -562,23 +562,27 @@ public class TranscoderService extends Service {
         pairingStatus = "Pairing with Jellyfin...";
         try {
             JSONObject payload = new JSONObject(AppConfig.connectionJson(this));
+            byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
             HttpURLConnection connection = (HttpURLConnection) new URL(pairUrl).openConnection();
+            connection.setInstanceFollowRedirects(false);
             connection.setRequestMethod("POST");
             connection.setConnectTimeout(10000);
             connection.setReadTimeout(10000);
             connection.setDoOutput(true);
-            connection.setRequestProperty("Content-Type", "application/json");
-            byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            connection.setRequestProperty("Accept", "application/json");
             connection.setFixedLengthStreamingMode(body.length);
             try (OutputStream out = connection.getOutputStream()) {
                 out.write(body);
             }
             int status = connection.getResponseCode();
+            String location = connection.getHeaderField("Location");
             InputStream response = status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream();
             String text = response == null ? "" : readAll(response);
             if (status < 200 || status >= 300) {
                 Log.w(TAG, "Pairing failed: HTTP " + status + " " + text);
-                pairingStatus = "Jellyfin was reached, but rejected pairing: HTTP " + status;
+                pairingStatus = pairingFailureMessage(status, text, location);
+                connection.disconnect();
                 return;
             }
             JSONObject json = new JSONObject(text);
@@ -589,10 +593,31 @@ public class TranscoderService extends Service {
             AppConfig.setPairedJellyfinUrl(this, pairUrl);
             pairingStatus = "Paired with Jellyfin";
             Log.i(TAG, "Paired with Jellyfin at " + pairUrl);
+            connection.disconnect();
         } catch (Exception ex) {
             pairingStatus = "Jellyfin server could not be reached. Open the Android Transcoder page using a Jellyfin URL this phone can visit, then scan that QR code.";
             Log.w(TAG, "Pairing failed", ex);
         }
+    }
+
+    private static String pairingFailureMessage(int status, String body, String location) {
+        String error = "";
+        try {
+            JSONObject json = new JSONObject(body);
+            error = json.optString("error", "");
+        } catch (Exception ignored) {
+        }
+        if ("pairing_code_invalid_or_expired".equals(error)) {
+            return "Jellyfin rejected this QR code because it expired or was replaced. Refresh the Jellyfin Android Transcoder page and scan the new QR.";
+        }
+        if (status >= 300 && status < 400) {
+            String target = location == null || location.trim().isEmpty() ? "another URL" : location.trim();
+            return "Jellyfin redirected the QR request to " + target + ". Open the Android Transcoder page at the final phone-reachable Jellyfin URL, then scan again.";
+        }
+        if (error.isEmpty()) {
+            return "Jellyfin was reached, but rejected pairing: HTTP " + status;
+        }
+        return "Jellyfin rejected pairing: " + error + " (HTTP " + status + ")";
     }
 
     private static void writeJson(HttpServerResponse response, JSONObject json) {

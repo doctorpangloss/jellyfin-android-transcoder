@@ -176,6 +176,8 @@ Install the plugin:
 
 The live plugin page tests the configured Android device from Jellyfin every time it renders, using a 1 second health check. If the phone cannot reach the QR URL, open Jellyfin using a URL the phone can visit and scan that QR code instead. If Jellyfin cannot reach the phone, use the phone's setup URL described below.
 
+QR pairing uses a short-lived Jellyfin pairing URL, such as `http://JELLYFIN:8096/AndroidTranscoder/Pair/123456`. The code is not the Android bearer token. The Android app POSTs JSON containing its setup URL candidates, four-digit phone token, and bitrate preference to that endpoint. A valid current scan overwrites the existing Android connection with the phone that scanned it. If scanning reports a redirect, open Jellyfin at the final URL that the phone can reach directly, then scan the QR from that page.
+
 ![Jellyfin Android Transcoder plugin page](docs/assets/jellyfin-plugin-page.png)
 
 Manual setup, if QR pairing is not available:
