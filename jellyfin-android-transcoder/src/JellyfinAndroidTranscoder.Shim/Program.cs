@@ -731,6 +731,7 @@ public static class AndroidTranscode
         string.Equals(command.ValueAfter("-hls_segment_type"), "mpegts", StringComparison.OrdinalIgnoreCase);
 
     private static bool ShouldUseRemoteVideoStdout(FfmpegCommand command) =>
+        command.AudioRequested ||
         IsMpegtsHls(command) ||
         !string.IsNullOrWhiteSpace(command.FilterComplex);
 

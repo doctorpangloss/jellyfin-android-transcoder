@@ -52,7 +52,7 @@ JSON
         Assert.Equal(0, exitCode);
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
         Assert.Contains("segment0.ts", await File.ReadAllTextAsync(output));
-        Assert.Equal("mpegts-from-android", await File.ReadAllTextAsync(Path.Combine(_tempDir, "segment0.ts")));
+        Assert.Equal("remuxed-media", await File.ReadAllTextAsync(Path.Combine(_tempDir, "segment0.ts")));
 
         var request = await android.GetSingleRequest();
         Assert.Equal("/api/v1/remoteprocesses", request.Path);
@@ -68,8 +68,8 @@ JSON
         Assert.Contains("\"-g\",\"72\"", request.RemoteArgs);
         Assert.Contains("\"-force_key_frames\",\"expr:gte(t,n_forced*3)\"", request.RemoteArgs);
         Assert.DoesNotContain("\"-sc_threshold\"", request.RemoteArgs);
-        Assert.Contains("\"-f\",\"hls\"", request.RemoteArgs);
-        Assert.Contains("\"-hls_list_size\",\"0\"", request.RemoteArgs);
+        Assert.Contains("\"-f\",\"mpegts\"", request.RemoteArgs);
+        Assert.DoesNotContain("\"-codec:a:0\"", request.RemoteArgs);
         Assert.DoesNotContain("\"-hls_playlist_type\"", request.RemoteArgs);
         Assert.Equal(1, android.StatusRequestCount);
         Assert.Equal(0, CountOccurrences(request.RemoteArgs, "\"-t\""));
@@ -114,7 +114,7 @@ JSON
         Assert.True(File.Exists(output), "The shim must create Jellyfin's requested HLS playlist path.");
         Assert.True(File.Exists(segment), "The shim must create Jellyfin's requested HLS segment path.");
         Assert.Contains("#EXTM3U", await File.ReadAllTextAsync(output));
-        Assert.Equal("mpegts-chunk-ampegts-chunk-b", await File.ReadAllTextAsync(segment));
+        Assert.Equal("remuxed-media", await File.ReadAllTextAsync(segment));
 
         var request = await android.GetSingleRequest();
         Assert.Equal(File.ReadAllText(input).Length, request.BodyLength);
@@ -301,13 +301,13 @@ JSON
 
         await using var android = await MockAndroidService.Start(
             new Dictionary<string, byte[]>(),
-            holdFilesStreamOpen: true);
+            holdStdoutStreamOpen: true);
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var shimExecutable = await BuildShimExecutable();
         using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
         var stderr = process.StandardError.ReadToEndAsync();
-        await android.WaitForFilesStream();
+        await android.WaitForStdoutStream();
         await process.StandardInput.WriteLineAsync("q");
         await process.StandardInput.FlushAsync();
 
@@ -334,7 +334,7 @@ JSON
     }
 
     [Fact]
-    public async Task JellyfinStopCommandDoesNotStartLocalRemuxChild()
+    public async Task JellyfinStopCommandStopsLocalRemuxChild()
     {
         var pidFile = Path.Combine(_tempDir, "remux.pid");
         var ffmpeg = WriteExecutable("fake-ffmpeg-remux-child.sh", $$"""
@@ -362,13 +362,19 @@ JSON
 
         await using var android = await MockAndroidService.Start(
             new Dictionary<string, byte[]>(),
-            holdFilesStreamOpen: true);
+            holdStdoutStreamOpen: true);
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var shimExecutable = await BuildShimExecutable();
         using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
-        await android.WaitForFilesStream();
-        Assert.False(File.Exists(pidFile), "The HLS mirror path must not start a local remux child.");
+        await android.WaitForStdoutStream();
+        var childDeadline = Stopwatch.StartNew();
+        while (!File.Exists(pidFile) && childDeadline.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            await Task.Delay(50);
+        }
+        Assert.True(File.Exists(pidFile), "The video stdout path must start the local HLS packager.");
+        var childPid = int.Parse(await File.ReadAllTextAsync(pidFile));
 
         await process.StandardInput.WriteLineAsync("q");
         await process.StandardInput.FlushAsync();
@@ -376,6 +382,7 @@ JSON
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await process.WaitForExitAsync(timeout.Token);
         Assert.Contains("/api/v1/remoteprocesses/job-1", android.DeletePaths);
+        Assert.False(IsProcessAlive(childPid), "Stopping Jellyfin's shim must also stop its local HLS packager.");
     }
 
     [Fact]
@@ -404,13 +411,13 @@ JSON
 
         await using var android = await MockAndroidService.Start(
             new Dictionary<string, byte[]>(),
-            holdFilesStreamOpen: true);
+            holdStdoutStreamOpen: true);
         WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
 
         var shimExecutable = await BuildShimExecutable();
         using var process = StartShimForControlTest(shimExecutable, JellyfinArgs(input, output));
         var stderr = process.StandardError.ReadToEndAsync();
-        await android.WaitForFilesStream();
+        await android.WaitForStdoutStream();
 
         using (var kill = Process.Start("kill", ["-TERM", process.Id.ToString()])!)
         {
@@ -493,6 +500,46 @@ JSON
         Assert.Contains("\"-hls_segment_type\",\"fmp4\"", request.RemoteArgs);
         Assert.Contains("\"-hls_list_size\",\"0\"", request.RemoteArgs);
         Assert.DoesNotContain("\"-hls_playlist_type\"", request.RemoteArgs);
+    }
+
+    [Fact]
+    public async Task BrowserFmp4CommandWithAudioRoutesVideoOnlyAndPackagesAudioLocally()
+    {
+        var ffmpeg = WriteRemuxFfmpeg("fake-ffmpeg-inception-audio.sh");
+        var ffprobe = WriteExecutable("fake-ffprobe-inception-audio.sh", """
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":3840,"height":2160,"bit_rate":"63810668","color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020"}],"format":{"duration":"8888.299"}}
+JSON
+""");
+        var ffmpegLog = Path.Combine(_tempDir, "inception-audio-remux.log");
+        Environment.SetEnvironmentVariable("JFAT_FAKE_FFMPEG_LOG", ffmpegLog);
+        await File.WriteAllTextAsync(ffmpegLog, "");
+
+        var input = Path.Combine(_tempDir, "Inception (2010) Remux-2160p.mkv");
+        await File.WriteAllTextAsync(input, string.Concat(Enumerable.Repeat("inception-hevc-dts-data-", 4096)));
+        var output = Path.Combine(_tempDir, "inception.m3u8");
+
+        await using var android = await MockAndroidService.Start(new Dictionary<string, byte[]>());
+        WriteConfig(android.BaseUrl, android.Token, ffmpeg, ffprobe, maxBitrate: 6_000_000);
+
+        var exitCode = await Program.Main(InceptionFmp4WithAudioArgs(input, output));
+
+        Assert.Equal(0, exitCode);
+        var request = await android.GetSingleRequest();
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
+        AssertOption(remoteArgs, "-f", "mpegts");
+        Assert.Contains("pipe:1", remoteArgs);
+        Assert.DoesNotContain("0:1", remoteArgs);
+        Assert.DoesNotContain("-codec:a:0", remoteArgs);
+        Assert.DoesNotContain("libfdk_aac", remoteArgs);
+
+        var remuxLog = await File.ReadAllTextAsync(ffmpegLog);
+        Assert.Contains("-map 1:a:0", remuxLog);
+        Assert.Contains("-codec:a:0 libfdk_aac", remuxLog);
+        Assert.Contains("-af volume=2", remuxLog);
+        Assert.Contains("-hls_segment_type fmp4", remuxLog);
     }
 
     [Fact]
@@ -1166,6 +1213,19 @@ exit 0
         return count;
     }
 
+    private static bool IsProcessAlive(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
     private static void AssertOption(IReadOnlyList<string> args, string option, string? value)
     {
         var index = Array.IndexOf(args.ToArray(), option);
@@ -1267,6 +1327,26 @@ exit 0
         "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "70e040ca627b1a5a2ecb0618aa77f67c-1.mp4",
         "-start_number", "0", "-hls_segment_filename",
         Path.Combine(Path.GetDirectoryName(output)!, "70e040ca627b1a5a2ecb0618aa77f67c%d.mp4"),
+        "-hls_playlist_type", "vod", "-hls_list_size", "0",
+        "-hls_segment_options", "movflags=+frag_discont", "-y", output
+    ];
+
+    private static string[] InceptionFmp4WithAudioArgs(string input, string output) =>
+    [
+        "-analyzeduration", "200M", "-probesize", "1G", "-i", $"file:{input}",
+        "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+        "-map", "0:0", "-map", "0:1", "-map", "-0:s",
+        "-codec:v:0", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-maxrate", "7616000", "-bufsize", "15232000", "-profile:v:0", "high",
+        "-level", "51", "-force_key_frames:0", "expr:gte(t,n_forced*3)",
+        "-sc_threshold:v:0", "0", "-vf",
+        @"setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2,tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p",
+        "-codec:a:0", "libfdk_aac", "-ac", "2", "-ab", "256000", "-af", "volume=2",
+        "-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048",
+        "-f", "hls", "-max_delay", "5000000", "-hls_time", "3",
+        "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "inception-1.mp4",
+        "-start_number", "0", "-hls_segment_filename",
+        Path.Combine(Path.GetDirectoryName(output)!, "inception%d.mp4"),
         "-hls_playlist_type", "vod", "-hls_list_size", "0",
         "-hls_segment_options", "movflags=+frag_discont", "-y", output
     ];
