@@ -299,7 +299,7 @@ public sealed class AndroidTranscoderController : ControllerBase
         "-copyts",
         "-ss", seek,
         "-i", "file:" + path,
-        "-map", "0",
+        "-map", "0:v:0",
         "-c", "copy",
         "-avoid_negative_ts", "disabled",
         "-f", "matroska",

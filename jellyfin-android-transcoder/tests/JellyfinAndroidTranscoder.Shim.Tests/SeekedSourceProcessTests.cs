@@ -15,6 +15,7 @@ public sealed class SeekedSourceProcessTests
         AssertOption(args, "-ss", "00:01:21.000");
         AssertOption(args, "-avoid_negative_ts", "disabled");
         AssertOption(args, "-i", "file:/media/movies/Inception.mkv");
+        AssertOption(args, "-map", "0:v:0");
     }
 
     private static void AssertOption(IReadOnlyList<string> args, string option, string value)
