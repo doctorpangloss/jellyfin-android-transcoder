@@ -530,6 +530,8 @@ JSON
         var request = await android.GetSingleRequest();
         var remoteArgs = JsonSerializer.Deserialize<string[]>(request.RemoteArgs) ?? [];
         AssertOption(remoteArgs, "-f", "mpegts");
+        AssertOption(remoteArgs, "-muxpreload", "0");
+        AssertOption(remoteArgs, "-muxdelay", "0");
         Assert.Contains("pipe:1", remoteArgs);
         Assert.DoesNotContain("0:1", remoteArgs);
         Assert.DoesNotContain("-codec:a:0", remoteArgs);

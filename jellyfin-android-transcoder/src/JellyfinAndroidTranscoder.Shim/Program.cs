@@ -1205,6 +1205,8 @@ public static class AndroidTranscode
             "-an",
             "-sn",
             "-dn",
+            "-muxpreload", "0",
+            "-muxdelay", "0",
             "-f", "mpegts",
             "pipe:1"
         ]);
