@@ -1154,9 +1154,18 @@ public static class AndroidTranscode
                 "-ndk_codec", "1"
             ]);
         }
+        var preserveSourceTimeline = sourceUrl is not null && !string.IsNullOrWhiteSpace(command.SeekBeforeInput);
+        if (preserveSourceTimeline)
+        {
+            args.Add("-copyts");
+        }
         AddPreservedInputOptions(args, command, sourceUrl is not null);
         AddInputStreamDisables(args);
         args.AddRange(["-i", sourceUrl ?? "{input}"]);
+        if (preserveSourceTimeline)
+        {
+            args.AddRange(["-avoid_negative_ts", "disabled"]);
+        }
         AddPreservedVideoMap(args, command);
         AddPreservedOutputOptions(args, command);
         if (useHardwareDecoder)

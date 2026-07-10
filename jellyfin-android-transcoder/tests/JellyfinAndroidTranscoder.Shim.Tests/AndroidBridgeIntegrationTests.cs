@@ -939,6 +939,9 @@ JSON
         Assert.Contains("ss=00%3A00%3A30.000", request.RemoteArgs);
         Assert.DoesNotContain("\"-ss\",\"00:00:30.000\",\"-i\",\"http://jellyfin.example.test/AndroidTranscoder/Source/", request.RemoteArgs);
         Assert.DoesNotContain("-noaccurate_seek", remoteArgs);
+        AssertOption(remoteArgs, "-copyts", null);
+        AssertOption(remoteArgs, "-avoid_negative_ts", "disabled");
+        Assert.DoesNotContain("-start_at_zero", remoteArgs);
         Assert.DoesNotContain("\"-i\",\"{input}\"", request.RemoteArgs);
         Assert.Equal(0, request.BodyLength);
         Assert.Equal("remuxed-media", await File.ReadAllTextAsync(Path.Combine(_tempDir, "source0.ts")));
