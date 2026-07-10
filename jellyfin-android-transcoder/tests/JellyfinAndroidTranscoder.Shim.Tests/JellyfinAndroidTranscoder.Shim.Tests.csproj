@@ -19,6 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Jellyfin.Plugin.AndroidTranscoder\Jellyfin.Plugin.AndroidTranscoder.csproj" />
     <ProjectReference Include="..\..\src\JellyfinAndroidTranscoder.Shim\JellyfinAndroidTranscoder.Shim.csproj" />
   </ItemGroup>
 

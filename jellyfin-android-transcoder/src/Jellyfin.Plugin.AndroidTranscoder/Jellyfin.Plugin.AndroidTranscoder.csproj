@@ -18,6 +18,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="JellyfinAndroidTranscoder.Shim.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Jellyfin.Controller" Version="10.11.6" />
     <PackageReference Include="Jellyfin.Model" Version="10.11.6" />
     <PackageReference Include="QRCoder" Version="1.6.0" />

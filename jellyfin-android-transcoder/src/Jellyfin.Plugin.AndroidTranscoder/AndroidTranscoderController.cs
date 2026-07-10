@@ -274,16 +274,7 @@ public sealed class AndroidTranscoderController : ControllerBase
             RedirectStandardError = true,
             UseShellExecute = false
         };
-        foreach (var arg in new[]
-        {
-            "-hide_banner", "-loglevel", "error",
-            "-ss", seek,
-            "-i", "file:" + path,
-            "-map", "0",
-            "-c", "copy",
-            "-f", "matroska",
-            "pipe:1"
-        })
+        foreach (var arg in BuildSeekedSourceArguments(path, seek))
         {
             start.ArgumentList.Add(arg);
         }
@@ -301,6 +292,19 @@ public sealed class AndroidTranscoderController : ControllerBase
         });
         return process;
     }
+
+    internal static IReadOnlyList<string> BuildSeekedSourceArguments(string path, string seek) =>
+    [
+        "-hide_banner", "-loglevel", "error",
+        "-copyts",
+        "-ss", seek,
+        "-i", "file:" + path,
+        "-map", "0",
+        "-c", "copy",
+        "-avoid_negative_ts", "disabled",
+        "-f", "matroska",
+        "pipe:1"
+    ];
 
     [HttpPost("Test")]
     public async Task<ActionResult<object>> Test()
