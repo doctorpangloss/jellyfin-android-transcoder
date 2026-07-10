@@ -25,7 +25,7 @@ chmod 755 "$WORK/plugin/Android Transcoder_$VERSION/shim-payload/jfat-ffmpeg"
 cat > "$WORK/plugin/Android Transcoder_$VERSION/meta.json" <<JSON
 {
   "category": "Transcoding",
-  "changelog": "Initial public release.",
+  "changelog": "Verified release with audio synchronization and seek timeline fixes.",
   "description": "Routes eligible Jellyfin transcodes to an Android MediaCodec FFmpeg worker.",
   "guid": "7fd06ed7-4044-4d38-a6e3-8b4432ff8f8c",
   "name": "Android Transcoder",
@@ -60,7 +60,7 @@ cat > "$DIST/manifest.json" <<JSON
     "versions": [
       {
         "version": "$VERSION.0",
-        "changelog": "Initial public release.",
+        "changelog": "Verified release with audio synchronization and seek timeline fixes.",
         "targetAbi": "10.11.6.0",
         "sourceUrl": "https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/download/v$VERSION/Jellyfin.Plugin.AndroidTranscoder-$VERSION.zip",
         "checksum": "$plugin_sha",

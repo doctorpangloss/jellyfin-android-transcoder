@@ -10,6 +10,33 @@ Related repositories:
 - Patched FFmpeg fork: https://github.com/doctorpangloss/forks-ffmpeg-android
 - Integration tests: https://github.com/doctorpangloss/jellyfin-android-transcoder-integration
 
+## Install The Verified Release
+
+`v1.1.13` is the supported release. It was validated with Jellyfin `10.11.6`, a Linux x64 Jellyfin server, and an Android MediaCodec worker. It includes the audio synchronization and seek timeline fixes required for normal HLS playback.
+
+Requirements:
+
+- Android 9 or newer. Root and developer mode are not required for a normal sideload.
+- A persistent Jellyfin `/config` volume.
+- Jellyfin must reach the phone on TCP port `8098`.
+- The phone must reach the Jellyfin URL shown on the pairing page. This reverse path supplies source media during startup and seeking.
+
+Install in this order:
+
+1. On the phone, download and install [`jellyfin-android-transcoder-1.1.13.apk`](https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.1.13.apk). Open **Android Transcoder** and leave **Keep awake** enabled.
+2. In Jellyfin, open **Dashboard -> Plugins -> Repositories** and add:
+
+   ```text
+   https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/manifest.json
+   ```
+
+3. Install **Android Transcoder** from the Jellyfin catalog and restart Jellyfin.
+4. Open **Dashboard -> Plugins -> Android Transcoder**. On the phone, tap **Pair from QR** and scan the QR code shown by Jellyfin.
+5. Click **Refresh status** in Jellyfin and confirm **Connected**. Leave both **Use this phone for video transcodes** and **Use Android hardware codecs** enabled.
+6. Start a transcode. The Android **Status** tab should show an active job, and the Jellyfin log should report `jfat: routing ... through http://PHONE_IP:8098`.
+
+For Docker, install the plugin under the host directory mounted as `/config`; do not install it only in the container filesystem. The plugin and generated shim then survive container recreation.
+
 ## What It Does
 
 Jellyfin still invokes an FFmpeg-shaped executable. The plugin installs `jfat-ffmpeg` as a shim, and the shim preserves Jellyfin's normal HLS output contract while routing eligible HEVC/AV1 video transcodes to an Android foreground service.
@@ -60,11 +87,11 @@ The endpoint returns `404` with `{"canceled":false,...}` if the job id no longer
 
 ## Release Assets
 
-The `v1.0.0` release publishes:
+The `v1.1.13` release publishes:
 
-- `jellyfin-android-transcoder-1.0.0.apk`: direct sideload APK.
-- `jellyfin-android-transcoder-1.0.0.aab`: Android App Bundle for bundletool/Play-style installs.
-- `Jellyfin.Plugin.AndroidTranscoder-1.0.0.zip`: Jellyfin plugin zip.
+- `jellyfin-android-transcoder-1.1.13.apk`: direct sideload APK.
+- `jellyfin-android-transcoder-1.1.13.aab`: Android App Bundle for bundletool/Play-style installs.
+- `Jellyfin.Plugin.AndroidTranscoder-1.1.13.zip`: Jellyfin plugin zip.
 - `manifest.json`: Jellyfin plugin repository manifest.
 - `SHA256SUMS`: release checksums.
 
@@ -77,7 +104,7 @@ The Android artifact includes native FFmpeg payloads for `arm64-v8a`, `armeabi-v
 Download the APK on the Android phone. This is the file to install:
 
 ```text
-https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.0.0.apk
+https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.1.13.apk
 ```
 
 Scan this QR code on the phone to open the APK download:
@@ -86,7 +113,7 @@ Scan this QR code on the phone to open the APK download:
 
 After the APK downloads:
 
-1. Open the downloaded `jellyfin-android-transcoder-1.0.0.apk` from the browser downloads list or the Android **Files** app.
+1. Open the downloaded `jellyfin-android-transcoder-1.1.13.apk` from the browser downloads list or the Android **Files** app.
 2. If Android says the browser or Files app is not allowed to install unknown apps, tap **Settings** on that prompt.
 3. Enable **Allow from this source** for the app you used to open the APK, such as Chrome, Firefox, GitHub, or Files.
 4. Go back to the APK installer.
@@ -101,7 +128,7 @@ If Android returns to the downloads screen without showing **App installed**, th
 ADB install:
 
 ```bash
-adb install -r jellyfin-android-transcoder-1.0.0.apk
+adb install -r jellyfin-android-transcoder-1.1.13.apk
 adb shell monkey -p com.hiddenswitch.androidtranscoder 1
 ```
 
@@ -109,13 +136,13 @@ Bundletool install from the AAB:
 
 ```bash
 java -jar bundletool-all-1.18.3.jar build-apks \
-  --bundle jellyfin-android-transcoder-1.0.0.aab \
-  --output jellyfin-android-transcoder-1.0.0.apks \
+  --bundle jellyfin-android-transcoder-1.1.13.aab \
+  --output jellyfin-android-transcoder-1.1.13.apks \
   --mode universal \
   --overwrite
 
 java -jar bundletool-all-1.18.3.jar install-apks \
-  --apks jellyfin-android-transcoder-1.0.0.apks \
+  --apks jellyfin-android-transcoder-1.1.13.apks \
   --device-id <adb-device-id>
 ```
 
@@ -156,13 +183,13 @@ Install the plugin:
 2. Add the repository URL:
 
    ```text
-   https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/download/v1.0.0/manifest.json
+   https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/manifest.json
    ```
 
-3. Install **Android Transcoder** from the catalog, or manually unpack `Jellyfin.Plugin.AndroidTranscoder-1.0.0.zip` into:
+3. Install **Android Transcoder** from the catalog, or manually unpack `Jellyfin.Plugin.AndroidTranscoder-1.1.13.zip` into:
 
    ```text
-   ./jellyfin-config/plugins/Android Transcoder_1.0.0/
+   ./jellyfin-config/plugins/Android Transcoder_1.1.13/
    ```
 
 4. Restart Jellyfin.
@@ -222,7 +249,7 @@ ANDROID_NDK_ROOT=/home/administrator/android-ndk/android-ndk-r27d \
 Build release assets:
 
 ```bash
-VERSION=1.0.0 ANDROID_HOME="$HOME/Android/Sdk" ./scripts/package-release.sh
+VERSION=1.1.13 ANDROID_HOME="$HOME/Android/Sdk" ./scripts/package-release.sh
 ```
 
 Artifacts are written to `dist/`.
