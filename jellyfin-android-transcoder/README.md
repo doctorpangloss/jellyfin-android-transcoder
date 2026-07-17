@@ -26,26 +26,9 @@ The shim receives Jellyfin's FFmpeg arguments, preserves Jellyfin's HLS playlist
 
 ## Configure In Jellyfin
 
-After installing the plugin and restarting Jellyfin, open **Dashboard -> Plugins -> Android Transcoder**. The plugin page redirects to `/AndroidTranscoder/Page`, which renders the current QR code and tests the Android worker with a 1 second health check.
-
-Normal setup:
-
-1. Install and open the Android Transcoder APK on the phone.
-2. In Jellyfin, open the Android Transcoder plugin page.
-3. On the phone, tap **Pair from QR**.
-4. Scan the QR code shown by Jellyfin.
-5. Click **Refresh status** in Jellyfin and confirm the page shows **Connected**.
-
-Manual setup:
-
-1. In the Android app, tap **Copy setup URL**.
-2. Paste the single URL into the Jellyfin **Manual setup** field. It includes the phone address and token, for example `http://PHONE_IP:8098/?token=1234`.
-3. Click **Use setup URL**.
+1. Install and open the Android Transcoder APK.
+2. Open **Dashboard -> Plugins -> Android Transcoder** in Jellyfin.
+3. Tap **Pair from QR** on the phone and scan the code shown by Jellyfin.
 4. Click **Refresh status** and confirm **Connected**.
 
-The only user-facing options are:
-
-- **Use this phone for video transcodes**
-- **Use Android hardware codecs**
-
-Screenshots are in the repository-level `docs/assets/` directory.
+The illustrated install is in the repository-level README.

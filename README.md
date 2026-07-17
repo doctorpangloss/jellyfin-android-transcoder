@@ -12,30 +12,33 @@ Related repositories:
 
 ## Install The Verified Release
 
-`v1.1.13` is the supported release. It was validated with Jellyfin `10.11.6`, a Linux x64 Jellyfin server, and an Android MediaCodec worker. It includes the audio synchronization and seek timeline fixes required for normal HLS playback.
+Install `v1.1.13` in this order:
 
-Requirements:
-
-- Android 9 or newer. Root and developer mode are not required for a normal sideload.
-- A persistent Jellyfin `/config` volume.
-- Jellyfin must reach the phone on TCP port `8098`.
-- The phone must reach the Jellyfin URL shown on the pairing page. This reverse path supplies source media during startup and seeking.
-
-Install in this order:
-
-1. On the phone, download and install [`jellyfin-android-transcoder-1.1.13.apk`](https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.1.13.apk). Open **Android Transcoder** and leave **Keep awake** enabled.
-2. In Jellyfin, open **Dashboard -> Plugins -> Repositories** and add:
+1. On the phone, install the [APK](https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.1.13.apk), open **Android Transcoder**, and leave **Keep awake** on.
+2. In Jellyfin, open **Dashboard -> Plugins -> Manage Repositories -> New Repository** and add:
 
    ```text
    https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/manifest.json
    ```
 
-3. Install **Android Transcoder** from the Jellyfin catalog and restart Jellyfin.
-4. Open **Dashboard -> Plugins -> Android Transcoder**. On the phone, tap **Pair from QR** and scan the QR code shown by Jellyfin.
-5. Click **Refresh status** in Jellyfin and confirm **Connected**. Leave both **Use this phone for video transcodes** and **Use Android hardware codecs** enabled.
-6. Start a transcode. The Android **Status** tab should show an active job, and the Jellyfin log should report `jfat: routing ... through http://PHONE_IP:8098`.
+   ![Jellyfin plugin repository page](docs/assets/jellyfin-plugin-repositories.png)
 
-For Docker, install the plugin under the host directory mounted as `/config`; do not install it only in the container filesystem. The plugin and generated shim then survive container recreation.
+3. Return to **Plugins**, select **Available**, install **Android Transcoder**, and restart Jellyfin.
+4. Open **Dashboard -> Plugins** and select **Android Transcoder** from the card or the sidebar entry.
+
+   ![Android Transcoder in Jellyfin Plugins](docs/assets/jellyfin-plugins-navigation.png)
+
+5. On the phone, tap **Pair from QR**:
+
+   <img src="docs/assets/android-pairing.png" alt="Pair from QR in the Android app" width="280">
+
+   Then scan the QR code on the Jellyfin plugin page:
+
+   ![Android Transcoder pairing page in Jellyfin](docs/assets/jellyfin-plugin-page.png)
+
+6. In Jellyfin, click **Refresh status** and confirm **Connected**.
+
+The phone and Jellyfin server must be able to reach each other. Manual pairing is available by copying the setup URL from the Android app into the plugin page.
 
 ## What It Does
 
@@ -51,18 +54,12 @@ The remote process endpoint starts bundled patched FFmpeg, streams input into FF
 
 ## Benchmarks
 
-Measured on June 30, 2026 with Jellyfin `10.11.6`, plugin/shim `1.1.11`, Jellyfin FFmpeg `7.1.3-Jellyfin`, and the Android worker running on a Pixel-class device with the bundled Android MediaCodec FFmpeg build. The Synology baseline is the AMD Ryzen Embedded V1500B running Jellyfin's software `libx264` path.
+The source is 4K HEVC 10-bit at approximately 60 Mbps. The destination is 1080p H.264 at 6 Mbps in Jellyfin HLS. RT rate is output duration divided by elapsed time; values above `1.0x` are real-time.
 
-The input was a local 4K HEVC 10-bit remux sample. The benchmark command was Jellyfin-shaped HLS output at 1080p H.264, 6 Mbps, 3 second fMP4 segments, video only. RT rate is HLS media seconds produced divided by elapsed wall-clock seconds.
-
-| Workload | Path | Window | Media produced | RT rate | Notes |
-| --- | --- | ---: | ---: | ---: | --- |
-| 4K HEVC10 SDR -> 1080p H.264 | V1500B software `libx264` | 25.835 s | 30 s | 1.16x | Real-time on this sample. |
-| 4K HEVC10 SDR -> 1080p H.264 | Android MediaCodec | 25.069 s | 27 s | 1.08x | Real-time, but close to the V1500B because network/source/HLS overhead dominates. |
-| 4K HEVC10 HDR10 -> 1080p H.264 SDR | V1500B software tone map + `libx264` | 61.546 s | 42 s | 0.68x | Not real-time; first HLS segment at 9.3 s. |
-| 4K HEVC10 HDR10 -> 1080p H.264 SDR | Android MediaCodec + GLES surface tonemap | 60.043 s | 72 s | 1.20x | Real-time once started; first HLS segment at 15.6 s. |
-
-Interpretation: the Android path is viable for SDR HEVC transcodes and can beat the V1500B software path for HDR10 tone-map work when it uses the video-only MPEG-TS stdout/remux path. Startup latency is still higher on the Android HDR path, and PGS/image subtitle burn-in is not accelerated by this release; avoid burn-in or use client-rendered/text subtitles for the Android path.
+| Input | V1500B | Android MediaCodec on Pixel 10 |
+| --- | ---: | ---: |
+| SDR | 1.16x | 1.08x |
+| HDR10 to SDR | 0.68x | 1.20x |
 
 ## Job Liveness
 
@@ -96,137 +93,6 @@ The `v1.1.13` release publishes:
 - `SHA256SUMS`: release checksums.
 
 The Android artifact includes native FFmpeg payloads for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`.
-
-## Android Install
-
-### Direct Phone Install
-
-Download the APK on the Android phone. This is the file to install:
-
-```text
-https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.1.13.apk
-```
-
-Scan this QR code on the phone to open the APK download:
-
-![QR code for latest Android APK](docs/assets/android-apk-latest-qr.png)
-
-After the APK downloads:
-
-1. Open the downloaded `jellyfin-android-transcoder-1.1.13.apk` from the browser downloads list or the Android **Files** app.
-2. If Android says the browser or Files app is not allowed to install unknown apps, tap **Settings** on that prompt.
-3. Enable **Allow from this source** for the app you used to open the APK, such as Chrome, Firefox, GitHub, or Files.
-4. Go back to the APK installer.
-5. If Play Protect appears, expand **More details** if needed and choose **Install anyway** or **Continue**. A message like **Play Protect is already turned on** is not the final install confirmation.
-6. Tap **Install**.
-7. After installation, open **Android Transcoder**.
-8. Leave **Keep awake** enabled. It is on by default so the phone keeps the CPU, screen, and Wi-Fi active while it is acting as Jellyfin's video engine.
-9. Confirm Jellyfin can reach the phone by opening `http://PHONE_IP:8098/api/v1/status` from the Jellyfin server or container network.
-
-If Android returns to the downloads screen without showing **App installed**, the APK was not installed. Reopen the APK and finish the prompts above.
-
-ADB install:
-
-```bash
-adb install -r jellyfin-android-transcoder-1.1.13.apk
-adb shell monkey -p com.hiddenswitch.androidtranscoder 1
-```
-
-Bundletool install from the AAB:
-
-```bash
-java -jar bundletool-all-1.18.3.jar build-apks \
-  --bundle jellyfin-android-transcoder-1.1.13.aab \
-  --output jellyfin-android-transcoder-1.1.13.apks \
-  --mode universal \
-  --overwrite
-
-java -jar bundletool-all-1.18.3.jar install-apks \
-  --apks jellyfin-android-transcoder-1.1.13.apks \
-  --device-id <adb-device-id>
-```
-
-The app must be reachable from the Jellyfin container. On Tailscale, use the phone's Tailscale IP in the setup URL or Jellyfin plugin settings.
-
-### Android App Screens
-
-The **Pairing** tab shows one QR action and one copy/paste setup URL. Tap the URL itself or tap **Copy setup URL** to copy it to the clipboard. The token in the URL is a random four-digit setup code generated on first start. Use **Reset setup code** to rotate it.
-
-![Android Transcoder pairing screen](docs/assets/android-pairing.png)
-
-The **Status** tab shows service state, whether keep-awake is enabled, and active job counters.
-
-![Android Transcoder status screen](docs/assets/android-status.png)
-
-## Jellyfin Docker Compose Example
-
-```yaml
-services:
-  jellyfin:
-    image: jellyfin/jellyfin:10.11.6
-    container_name: jellyfin
-    network_mode: bridge
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "8096:8096"
-    volumes:
-      - ./jellyfin-config:/config
-      - ./jellyfin-cache:/cache
-      - /path/to/media:/media:ro
-    restart: unless-stopped
-```
-
-Install the plugin:
-
-1. In Jellyfin, go to **Dashboard -> Plugins -> Repositories**.
-2. Add the repository URL:
-
-   ```text
-   https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/manifest.json
-   ```
-
-3. Install **Android Transcoder** from the catalog, or manually unpack `Jellyfin.Plugin.AndroidTranscoder-1.1.13.zip` into:
-
-   ```text
-   ./jellyfin-config/plugins/Android Transcoder_1.1.13/
-   ```
-
-4. Restart Jellyfin.
-5. Open **Dashboard -> Plugins -> Android Transcoder**. The embedded Jellyfin plugin page redirects to the live Android Transcoder page at `/AndroidTranscoder/Page`.
-6. Open **Android Transcoder** on the phone.
-7. Tap **Pair from QR**.
-8. Scan the QR code shown by Jellyfin.
-9. Click **Refresh status** in Jellyfin. The page should show **Connected**.
-10. Leave **Use this phone for video transcodes** enabled.
-11. Leave **Use Android hardware codecs** enabled unless you are debugging the software path.
-
-The live plugin page tests the configured Android device from Jellyfin every time it renders, using a 1 second health check. If the phone cannot reach the QR URL, open Jellyfin using a URL the phone can visit and scan that QR code instead. If Jellyfin cannot reach the phone, use the phone's setup URL described below.
-
-QR pairing uses a short-lived Jellyfin pairing URL, such as `http://JELLYFIN:8096/AndroidTranscoder/Pair/123456`. The code is not the Android bearer token. The Android app POSTs JSON containing its setup URL candidates, four-digit phone token, and bitrate preference to that endpoint. A valid current scan overwrites the existing Android connection with the phone that scanned it. If scanning reports a redirect, open Jellyfin at the final URL that the phone can reach directly, then scan the QR from that page.
-
-![Jellyfin Android Transcoder plugin page](docs/assets/jellyfin-plugin-page.png)
-
-Manual setup, if QR pairing is not available:
-
-1. In the Android app, tap **Copy setup URL**. It looks like:
-
-   ```text
-   http://PHONE_IP:8098/?token=1234
-   ```
-
-2. In Jellyfin, paste that one URL into **Manual setup**.
-3. Click **Use setup URL**.
-4. Click **Refresh status**.
-5. Confirm the page shows **Connected** and the configured phone URL.
-
-The plugin writes the shim to:
-
-```text
-/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/jfat-ffmpeg
-```
-
-and writes shim config beside it as `shim-config.json`.
 
 ## Build Locally
 
